@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Tuple
 
 import hydra
 import rootutils
+import torch
 from lightning import LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig
@@ -24,6 +25,7 @@ rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 # more info: https://github.com/ashleve/rootutils
 # ------------------------------------------------------------------------------------ #
 
+from src.models.components.simple_dense_net import SimpleDenseNet
 from src.utils import (
     RankedLogger,
     extras,
@@ -33,6 +35,11 @@ from src.utils import (
 )
 
 log = RankedLogger(__name__, rank_zero_only=True)
+
+
+def _register_safe_globals() -> None:
+    """Allowlist trusted custom classes used in checkpoints for PyTorch 2.6+."""
+    torch.serialization.add_safe_globals([SimpleDenseNet])
 
 
 @task_wrapper
@@ -46,6 +53,7 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     :return: Tuple[dict, dict] with metrics and dict with all instantiated objects.
     """
     assert cfg.ckpt_path
+    _register_safe_globals()
 
     log.info(f"Instantiating datamodule <{cfg.data._target_}>")
     datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data)
