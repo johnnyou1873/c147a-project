@@ -25,7 +25,6 @@ rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 # more info: https://github.com/ashleve/rootutils
 # ------------------------------------------------------------------------------------ #
 
-from src.models.components.simple_dense_net import SimpleDenseNet
 from src.utils import (
     RankedLogger,
     extras,
@@ -35,11 +34,6 @@ from src.utils import (
 )
 
 log = RankedLogger(__name__, rank_zero_only=True)
-
-
-def _register_safe_globals() -> None:
-    """Allowlist trusted custom classes used in checkpoints for PyTorch 2.6+."""
-    torch.serialization.add_safe_globals([SimpleDenseNet])
 
 
 @task_wrapper
@@ -53,7 +47,6 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     :return: Tuple[dict, dict] with metrics and dict with all instantiated objects.
     """
     assert cfg.ckpt_path
-    _register_safe_globals()
 
     log.info(f"Instantiating datamodule <{cfg.data._target_}>")
     datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data)
@@ -80,7 +73,12 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         log_hyperparameters(object_dict)
 
     log.info("Starting testing!")
-    trainer.test(model=model, datamodule=datamodule, ckpt_path=cfg.ckpt_path)
+    trainer.test(
+        model=model,
+        datamodule=datamodule,
+        ckpt_path=cfg.ckpt_path,
+        weights_only=False,
+    )
 
     # for predictions use trainer.predict(...)
     # predictions = trainer.predict(model=model, dataloaders=dataloaders, ckpt_path=cfg.ckpt_path)

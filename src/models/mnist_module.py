@@ -54,9 +54,9 @@ class MNISTLitModule(LightningModule):
         """
         super().__init__()
 
-        # this line allows to access init params with 'self.hparams' attribute
-        # also ensures init params will be stored in ckpt
-        self.save_hyperparameters(logger=False)
+        # avoid serializing module/optimizer objects into checkpoint hparams
+        # to keep compatibility with PyTorch's weights-only loading defaults
+        self.save_hyperparameters(logger=False, ignore=['net'])
 
         self.net = net
 
