@@ -101,34 +101,29 @@ class C147ALitModule(LightningModule):
         return aligned
 
     def _masked_losses(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        mask_f = mask.float()
-        per_token_sq = torch.sum((pred - target) ** 2, dim=-1)  # (B, L)
-        denom = mask_f.sum().clamp(min=1.0)
-        mse = torch.sum(per_token_sq * mask_f) / denom
+        tm_scores = []
+        for b in range(pred.shape[0]):
+            valid = mask[b]
+            n_res = int(valid.sum().item())
+            if n_res < 3:
+                continue
 
-        with torch.no_grad():
-            tm_scores = []
-            for b in range(pred.shape[0]):
-                valid = mask[b]
-                n_res = int(valid.sum().item())
-                if n_res < 3:
-                    continue
+            pred_b = pred[b, valid]
+            target_b = target[b, valid]
+            pred_aligned = self._kabsch_align(pred_b, target_b)
+            dist = torch.linalg.norm(pred_aligned - target_b, dim=-1)
 
-                pred_b = pred[b, valid]
-                target_b = target[b, valid]
-                pred_aligned = self._kabsch_align(pred_b, target_b)
-                dist = torch.linalg.norm(pred_aligned - target_b, dim=-1)
+            d0 = self._d0(n_res)
+            tm = torch.mean(1.0 / (1.0 + (dist / d0) ** 2))
+            tm_scores.append(tm)
 
-                d0 = self._d0(n_res)
-                tm = torch.mean(1.0 / (1.0 + (dist / d0) ** 2))
-                tm_scores.append(tm)
+        if tm_scores:
+            tm_score = torch.stack(tm_scores).mean()
+        else:
+            tm_score = pred.new_tensor(0.0)
 
-            if tm_scores:
-                tm_score = torch.stack(tm_scores).mean()
-            else:
-                tm_score = torch.tensor(0.0, device=pred.device)
-
-        return mse, tm_score
+        loss = 1.0 - tm_score
+        return loss, tm_score
 
     def model_step(self, batch: Dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         pred = self.forward(batch)
