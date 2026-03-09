@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from functools import partial
 from typing import Any, Dict
 
 import torch
@@ -300,10 +301,25 @@ class C147ALitModule(LightningModule):
         if self.hparams.scheduler is None:
             return {"optimizer": optimizer}
 
-        scheduler = self.hparams.scheduler(optimizer=optimizer)
+        scheduler_factory = self.hparams.scheduler
+        scheduler_keywords = getattr(scheduler_factory, "keywords", {}) or {}
+        scheduler_func = scheduler_factory.func if isinstance(scheduler_factory, partial) else scheduler_factory
+        is_onecycle = scheduler_func is torch.optim.lr_scheduler.OneCycleLR
+
+        scheduler_kwargs: Dict[str, Any] = {"optimizer": optimizer}
+        if is_onecycle and "total_steps" not in scheduler_keywords and not (
+            "epochs" in scheduler_keywords and "steps_per_epoch" in scheduler_keywords
+        ):
+            total_steps = int(getattr(self.trainer, "estimated_stepping_batches", 0))
+            if total_steps <= 0:
+                raise RuntimeError("OneCycleLR requires a positive `total_steps`.")
+            scheduler_kwargs["total_steps"] = total_steps
+
+        scheduler = scheduler_factory(**scheduler_kwargs)
+        interval = "step" if is_onecycle else "epoch"
         lr_scheduler: Dict[str, Any] = {
             "scheduler": scheduler,
-            "interval": "epoch",
+            "interval": interval,
             "frequency": 1,
         }
 

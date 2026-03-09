@@ -3,14 +3,17 @@ _target_: src.models.c147a_module.C147ALitModule
 optimizer:
   _target_: torch.optim.AdamW
   _partial_: true
-  lr: 0.0003
+  lr: 0.001
   weight_decay: 0.0001
 
 scheduler:
-  _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+  _target_: torch.optim.lr_scheduler.OneCycleLR
   _partial_: true
-  T_max: ${trainer.max_epochs}
-  eta_min: 1.0e-5
+  max_lr: 0.01
+  pct_start: 0.1
+  anneal_strategy: cos
+  div_factor: 25.0
+  final_div_factor: 1000.0
 
 net:
   _target_: src.models.components.folding_transformer.SE3FoldingTransformer
