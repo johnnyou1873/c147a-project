@@ -152,3 +152,8 @@ configs/local/default.yaml
 
 # Aim logging
 .aim
+
+# Kaggle credentials
+kaggle.json
+kaggle/kaggle.json
+.kaggle/
