@@ -3,23 +3,26 @@ _target_: src.models.c147a_module.C147ALitModule
 optimizer:
   _target_: torch.optim.AdamW
   _partial_: true
-  lr: 0.001
-  weight_decay: 0.0
+  lr: 0.0003
+  weight_decay: 0.0001
 
 scheduler:
-  _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
+  _target_: torch.optim.lr_scheduler.CosineAnnealingLR
   _partial_: true
-  mode: min
-  factor: 0.1
-  patience: 10
+  T_max: ${trainer.max_epochs}
+  eta_min: 1.0e-5
 
 net:
-  _target_: src.models.components.simple_dense_net.SimpleDenseNet
-  input_size: 784
-  lin1_size: 64
-  lin2_size: 128
-  lin3_size: 64
-  output_size: 10
+  _target_: src.models.components.folding_transformer.SE3FoldingTransformer
+  hidden_dim: 96
+  num_layers: 2
+  num_heads: 4
+  dropout: 0.1
+  residue_vocab_size: 5
+  max_chain_embeddings: 64
+  max_copy_embeddings: 64
+  recycling_passes: 5
+  coord_step_size: 0.25
 
 # compile model for faster training with pytorch 2.0
 compile: false

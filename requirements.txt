@@ -10,7 +10,7 @@ hydra-colorlog==1.2.0
 hydra-optuna-sweeper==1.2.0
 
 # --------- loggers --------- #
-# wandb
+wandb==0.12.0
 # neptune-client
 # mlflow
 # comet-ml
@@ -27,6 +27,10 @@ scikit-learn
 optree
 tqdm
 kaggle
+setuptools
+e3nn==0.3.3
+pynvml==11.0.0
+git+https://github.com/NVIDIA/dllogger#egg=dllogger
 rootutils       # standardizing the project root setup
 pre-commit      # hooks for applying linters on commit
 rich            # beautiful text formatting in terminal

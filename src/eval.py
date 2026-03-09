@@ -1,3 +1,4 @@
+import inspect
 from typing import Any, Dict, List, Tuple
 
 import hydra
@@ -33,7 +34,16 @@ from src.utils import (
     task_wrapper,
 )
 
+torch.set_float32_matmul_precision("medium")
+
 log = RankedLogger(__name__, rank_zero_only=True)
+
+
+def _call_trainer_method(method, **kwargs):
+    """Call a Trainer method and pass `weights_only=False` when supported."""
+    if "weights_only" in inspect.signature(method).parameters:
+        kwargs["weights_only"] = False
+    return method(**kwargs)
 
 
 @task_wrapper
@@ -73,11 +83,11 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         log_hyperparameters(object_dict)
 
     log.info("Starting testing!")
-    trainer.test(
+    _call_trainer_method(
+        trainer.test,
         model=model,
         datamodule=datamodule,
         ckpt_path=cfg.ckpt_path,
-        weights_only=False,
     )
 
     # for predictions use trainer.predict(...)

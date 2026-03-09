@@ -1,7 +1,12 @@
 _target_: src.data.c147a_datamodule.C147ADataModule
 data_dir: ${paths.data_dir}
-batch_size: 128 # Needs to be divisible by the number of devices (e.g., if in a distributed setup)
-train_val_test_split: [55_000, 5_000, 10_000]
-num_workers: 4
-pin_memory: True
-persistent_workers: True
+labels_file: train_labels.csv
+batch_size: 1
+num_workers: 0
+pin_memory: False
+persistent_workers: False
+train_fraction: 0.9
+val_fraction: 0.05
+max_residues_per_target: 128
+max_targets: 256
+seed: 42
