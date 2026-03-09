@@ -41,6 +41,8 @@ class C147ALitModule(LightningModule):
             resid=batch["resid"],
             coords=batch["coords"],
             mask=batch["mask"],
+            template_coords=batch.get("template_coords"),
+            template_mask=batch.get("template_mask"),
         )
 
     def on_train_start(self) -> None:
@@ -55,6 +57,33 @@ class C147ALitModule(LightningModule):
         return max(0.5, 1.24 * (float(n_res) - 15.0) ** (1.0 / 3.0) - 1.8)
 
     def _kabsch_align(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        use_fp32_linalg = pred.device.type == "cuda" and (
+            pred.dtype in (torch.float16, torch.bfloat16) or torch.is_autocast_enabled()
+        )
+
+        if use_fp32_linalg:
+            # In fp16/16-mixed on CUDA, SVD/eigh kernels for Half are not available.
+            # Run the Kabsch solve in fp32 with autocast disabled, then cast back.
+            with torch.autocast(device_type=pred.device.type, enabled=False):
+                pred_f = pred.to(dtype=torch.float32)
+                target_f = target.to(dtype=torch.float32)
+
+                pred_center = pred_f.mean(dim=0, keepdim=True)
+                target_center = target_f.mean(dim=0, keepdim=True)
+                pred_c = pred_f - pred_center
+                target_c = target_f - target_center
+
+                cov = pred_c.transpose(0, 1) @ target_c
+                u, _, vh = torch.linalg.svd(cov, full_matrices=False)
+                r = vh.transpose(0, 1) @ u.transpose(0, 1)
+                if torch.det(r) < 0:
+                    vh_fix = vh.clone()
+                    vh_fix[-1, :] *= -1
+                    r = vh_fix.transpose(0, 1) @ u.transpose(0, 1)
+
+                aligned = pred_c @ r + target_center
+            return aligned.to(dtype=pred.dtype)
+
         pred_center = pred.mean(dim=0, keepdim=True)
         target_center = target.mean(dim=0, keepdim=True)
         pred_c = pred - pred_center

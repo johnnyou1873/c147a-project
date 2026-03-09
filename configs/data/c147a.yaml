@@ -7,6 +7,16 @@ pin_memory: False
 persistent_workers: False
 train_fraction: 0.9
 val_fraction: 0.05
-max_residues_per_target: 128
+max_residues_per_target: 5120
 max_targets: 256
+temperature_k: 600.0
+apply_thermal_noise_train: true
+apply_thermal_noise_eval: false
+use_template_coords: true
+template_file: template_coords.pt
+precompute_templates_if_missing: true
+template_min_percent_identity: 50.0
+template_min_similarity: 0.1
+template_max_templates: 8
+template_length_ratio_tolerance: 0.3
 seed: 42

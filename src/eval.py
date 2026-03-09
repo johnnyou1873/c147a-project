@@ -1,4 +1,6 @@
 import inspect
+import os
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import hydra
@@ -37,6 +39,38 @@ from src.utils import (
 torch.set_float32_matmul_precision("medium")
 
 log = RankedLogger(__name__, rank_zero_only=True)
+
+
+def _prepare_wandb_env(cfg: DictConfig) -> None:
+    """Ensure wandb uses writable project-local dirs on Windows/restricted envs."""
+    logger_cfg = cfg.get("logger")
+    if not logger_cfg:
+        return
+
+    has_wandb = False
+    for _, lg_conf in logger_cfg.items():
+        if isinstance(lg_conf, DictConfig) and "_target_" in lg_conf:
+            target = str(lg_conf.get("_target_", "")).lower()
+            if "wandb" in target:
+                has_wandb = True
+                break
+    if not has_wandb:
+        return
+
+    output_dir = Path(str(cfg.paths.output_dir))
+    tmp_dir = output_dir / "tmp"
+    wandb_dir = output_dir / "wandb"
+    wandb_cache_dir = output_dir / "wandb-cache"
+    wandb_config_dir = output_dir / "wandb-config"
+    for d in (tmp_dir, wandb_dir, wandb_cache_dir, wandb_config_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    os.environ.setdefault("TMP", str(tmp_dir))
+    os.environ.setdefault("TEMP", str(tmp_dir))
+    os.environ.setdefault("WANDB_DIR", str(wandb_dir))
+    os.environ.setdefault("WANDB_CACHE_DIR", str(wandb_cache_dir))
+    os.environ.setdefault("WANDB_CONFIG_DIR", str(wandb_config_dir))
+    os.environ.setdefault("WANDB_START_METHOD", "thread")
 
 
 def _call_trainer_method(method, **kwargs):
@@ -107,6 +141,7 @@ def main(cfg: DictConfig) -> None:
     # apply extra utilities
     # (e.g. ask for tags if none are provided in cfg, print cfg tree, etc.)
     extras(cfg)
+    _prepare_wandb_env(cfg)
 
     evaluate(cfg)
 

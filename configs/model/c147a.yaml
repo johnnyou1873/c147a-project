@@ -14,15 +14,22 @@ scheduler:
 
 net:
   _target_: src.models.components.folding_transformer.SE3FoldingTransformer
-  hidden_dim: 96
-  num_layers: 2
+  hidden_dim: 256
+  num_layers: 4
   num_heads: 4
   dropout: 0.1
   residue_vocab_size: 5
   max_chain_embeddings: 64
   max_copy_embeddings: 64
-  recycling_passes: 5
+  recycling_passes: 8
   coord_step_size: 0.25
+  use_fast_multipole: true
+  fmm_cell_size: 64
+  fmm_near_cell_span: 1
+  fmm_exact_threshold: 768
+  fmm_max_levels: 4
+  fmm_far_topk: 32
+  fmm_dynamic_reordering: true
 
 # compile model for faster training with pytorch 2.0
 compile: false

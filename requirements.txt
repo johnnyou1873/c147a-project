@@ -10,14 +10,15 @@ hydra-colorlog==1.2.0
 hydra-optuna-sweeper==1.2.0
 
 # --------- loggers --------- #
-wandb==0.12.0
+wandb==0.25.0
 # neptune-client
 # mlflow
 # comet-ml
 # aim>=3.16.2  # no lower than 3.16.2, see https://github.com/aimhubio/aim/issues/2550
 
 # --------- others --------- #
-numpy
+# keep NumPy <2 for broad package compatibility in this stack
+numpy<2
 pandas
 biopython
 biotite
@@ -28,6 +29,7 @@ optree
 tqdm
 kaggle
 setuptools
+protobuf
 e3nn==0.3.3
 pynvml==11.0.0
 git+https://github.com/NVIDIA/dllogger#egg=dllogger
