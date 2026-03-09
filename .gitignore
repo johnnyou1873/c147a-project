@@ -157,3 +157,9 @@ configs/local/default.yaml
 kaggle.json
 kaggle/kaggle.json
 .kaggle/
+
+# Kaggle local data/model artifacts
+kaggle/input/*
+!kaggle/input/.gitkeep
+kaggle/working/*
+!kaggle/working/.gitkeep
