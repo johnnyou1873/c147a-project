@@ -20,6 +20,11 @@ hydra-optuna-sweeper==1.2.0
 numpy
 pandas
 biopython
+biotite
+rdkit
+ml-collections
+scikit-learn
+optree
 tqdm
 kaggle
 rootutils       # standardizing the project root setup
