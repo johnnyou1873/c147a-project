@@ -7,6 +7,11 @@ import torch
 from lightning import LightningModule
 from torchmetrics import MeanMetric, MinMetric
 
+try:
+    from scipy.optimize import linear_sum_assignment
+except Exception:  # pragma: no cover - optional runtime dependency
+    linear_sum_assignment = None
+
 
 class C147ALitModule(LightningModule):
     """Lightning module for RNA coordinate identity-refinement."""
@@ -17,6 +22,7 @@ class C147ALitModule(LightningModule):
         optimizer: torch.optim.Optimizer,
         scheduler: torch.optim.lr_scheduler,
         compile: bool,
+        use_permutation_aware_metric: bool = True,
     ) -> None:
         super().__init__()
         self.save_hyperparameters(logger=False, ignore=["net"])
@@ -100,36 +106,159 @@ class C147ALitModule(LightningModule):
         aligned = pred_c @ r + target_center
         return aligned
 
-    def _masked_losses(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        tm_scores = []
+    def _tm_score(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        n_res = int(pred.shape[0])
+        if n_res < 3:
+            return pred.new_tensor(0.0)
+
+        pred_aligned = self._kabsch_align(pred, target)
+        dist = torch.linalg.norm(pred_aligned - target, dim=-1)
+        d0 = self._d0(n_res)
+        tm = torch.mean(1.0 / (1.0 + (dist / d0) ** 2))
+        return tm.clamp(min=0.0, max=1.0)
+
+    def _assign_groups(self, cost: torch.Tensor) -> list[int]:
+        """Solve row->col assignment from a square cost matrix."""
+        n = int(cost.shape[0])
+        if n <= 1:
+            return list(range(n))
+
+        if linear_sum_assignment is not None:
+            row_idx, col_idx = linear_sum_assignment(cost.detach().cpu().numpy())
+            assignment = [0] * n
+            for r, c in zip(row_idx.tolist(), col_idx.tolist()):
+                assignment[int(r)] = int(c)
+            return assignment
+
+        # Fallback: greedy assignment if scipy is unavailable.
+        assignment = [-1] * n
+        used = set()
+        for r in range(n):
+            order = torch.argsort(cost[r]).tolist()
+            for c in order:
+                if c not in used:
+                    assignment[r] = int(c)
+                    used.add(int(c))
+                    break
+        for r in range(n):
+            if assignment[r] < 0:
+                for c in range(n):
+                    if c not in used:
+                        assignment[r] = c
+                        used.add(c)
+                        break
+        return assignment
+
+    def _permutation_aware_target(
+        self,
+        pred_b: torch.Tensor,
+        target_b: torch.Tensor,
+        chain_idx_b: torch.Tensor,
+        copy_idx_b: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reorder target groups (chain/copy blocks) to be robust to copy swaps."""
+        group_lists: Dict[tuple[int, int], list[int]] = {}
+        for i in range(pred_b.shape[0]):
+            key = (int(chain_idx_b[i].item()), int(copy_idx_b[i].item()))
+            group_lists.setdefault(key, []).append(i)
+
+        groups_by_chain: Dict[int, list[tuple[int, torch.Tensor]]] = {}
+        for (chain_id, copy_id), idx_list in group_lists.items():
+            idx_tensor = torch.tensor(idx_list, device=pred_b.device, dtype=torch.long)
+            groups_by_chain.setdefault(chain_id, []).append((copy_id, idx_tensor))
+
+        target_perm = target_b.clone()
+        for _, groups in groups_by_chain.items():
+            if len(groups) <= 1:
+                continue
+            groups.sort(key=lambda x: x[0])
+            indices = [g[1] for g in groups]
+            n = len(indices)
+            cost = pred_b.new_full((n, n), fill_value=1.0)
+
+            for i in range(n):
+                idx_i = indices[i]
+                p = pred_b[idx_i].to(dtype=torch.float32)
+                for j in range(n):
+                    idx_j = indices[j]
+                    if idx_i.numel() != idx_j.numel() or idx_i.numel() < 3:
+                        continue
+                    t = target_b[idx_j].to(dtype=torch.float32)
+                    tm_ij = self._tm_score(p, t)
+                    cost[i, j] = (1.0 - tm_ij).to(dtype=cost.dtype)
+
+            assignment = self._assign_groups(cost)
+            for i, j in enumerate(assignment):
+                idx_i = indices[i]
+                idx_j = indices[j]
+                if idx_i.numel() != idx_j.numel():
+                    continue
+                target_perm[idx_i] = target_b[idx_j]
+
+        return target_perm
+
+    def _masked_losses(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+        chain_idx: torch.Tensor,
+        copy_idx: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Differentiable TM-score for optimization.
+        tm_scores_train = []
         for b in range(pred.shape[0]):
             valid = mask[b]
-            n_res = int(valid.sum().item())
-            if n_res < 3:
-                continue
-
             pred_b = pred[b, valid]
             target_b = target[b, valid]
-            pred_aligned = self._kabsch_align(pred_b, target_b)
-            dist = torch.linalg.norm(pred_aligned - target_b, dim=-1)
+            if pred_b.shape[0] < 3:
+                continue
+            tm_scores_train.append(self._tm_score(pred_b, target_b))
 
-            d0 = self._d0(n_res)
-            tm = torch.mean(1.0 / (1.0 + (dist / d0) ** 2))
-            tm_scores.append(tm)
-
-        if tm_scores:
-            tm_score = torch.stack(tm_scores).mean()
+        if tm_scores_train:
+            tm_train = torch.stack(tm_scores_train).mean()
         else:
-            tm_score = pred.new_tensor(0.0)
+            tm_train = pred.new_tensor(0.0)
 
-        loss = 1.0 - tm_score
-        return loss, tm_score
+        loss = 1.0 - tm_train
+
+        if self.training:
+            # Keep train-step logging lightweight.
+            tm_metric = tm_train.detach()
+        else:
+            # Metric path: no-grad, permutation-aware across copy groups.
+            with torch.no_grad():
+                tm_scores_metric = []
+                for b in range(pred.shape[0]):
+                    valid = mask[b]
+                    pred_b = pred[b, valid].to(dtype=torch.float32)
+                    target_b = target[b, valid].to(dtype=torch.float32)
+                    chain_b = chain_idx[b, valid]
+                    copy_b = copy_idx[b, valid]
+                    if pred_b.shape[0] < 3:
+                        continue
+
+                    if self.hparams.use_permutation_aware_metric:
+                        target_eval = self._permutation_aware_target(pred_b, target_b, chain_b, copy_b)
+                    else:
+                        target_eval = target_b
+
+                    tm_scores_metric.append(self._tm_score(pred_b, target_eval))
+
+                if tm_scores_metric:
+                    tm_metric = torch.stack(tm_scores_metric).mean().to(dtype=pred.dtype)
+                else:
+                    tm_metric = pred.new_tensor(0.0)
+
+        return loss, tm_metric
 
     def model_step(self, batch: Dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         pred = self.forward(batch)
         target = batch["target_coords"]
         mask = batch["mask"]
-        return self._masked_losses(pred, target, mask)
+        chain_idx = batch["chain_idx"]
+        copy_idx = batch["copy_idx"]
+        return self._masked_losses(pred, target, mask, chain_idx, copy_idx)
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         loss, tm_score = self.model_step(batch)

@@ -33,3 +33,4 @@ net:
 
 # compile model for faster training with pytorch 2.0
 compile: false
+use_permutation_aware_metric: true
