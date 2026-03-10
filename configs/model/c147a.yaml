@@ -9,7 +9,7 @@ optimizer:
 scheduler:
   _target_: torch.optim.lr_scheduler.OneCycleLR
   _partial_: true
-  max_lr: 0.01
+  max_lr: 0.001
   pct_start: 0.1
   anneal_strategy: cos
   div_factor: 25.0
@@ -17,14 +17,14 @@ scheduler:
 
 net:
   _target_: src.models.components.folding_transformer.SE3FoldingTransformer
-  hidden_dim: 256
-  num_layers: 4
+  hidden_dim: 512
+  num_layers: 6
   num_heads: 4
   dropout: 0.1
   residue_vocab_size: 5
   max_chain_embeddings: 64
   max_copy_embeddings: 64
-  recycling_passes: 8
+  recycling_passes: 4
   coord_step_size: 0.25
   use_fast_multipole: true
   fmm_cell_size: 64
@@ -33,7 +33,21 @@ net:
   fmm_max_levels: 4
   fmm_far_topk: 32
   fmm_dynamic_reordering: true
+  use_block_sparse_attention: false
+  block_sparse_min_seq_len: 512
+  block_sparse_block_size: 64
+  block_sparse_window: 256
+  block_sparse_global_stride: 128
+  block_sparse_max_global: 64
+  block_sparse_dilation: 1
+  block_sparse_geo_topk: 16
+  pure_sparse_mode: false
 
 # compile model for faster training with pytorch 2.0
 compile: false
 use_permutation_aware_metric: true
+must_be_better_weight: 0.5
+must_be_better_margin: 0.01
+must_be_better_log_scale: 8.0
+must_be_better_min_factor: 0.2
+must_be_better_max_factor: 3.0

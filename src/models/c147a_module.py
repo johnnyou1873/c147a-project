@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import math
 from functools import partial
 from typing import Any, Dict
@@ -24,6 +25,11 @@ class C147ALitModule(LightningModule):
         scheduler: torch.optim.lr_scheduler,
         compile: bool,
         use_permutation_aware_metric: bool = True,
+        must_be_better_weight: float = 0.5,
+        must_be_better_margin: float = 0.01,
+        must_be_better_log_scale: float = 8.0,
+        must_be_better_min_factor: float = 0.2,
+        must_be_better_max_factor: float = 3.0,
     ) -> None:
         super().__init__()
         self.save_hyperparameters(logger=False, ignore=["net"])
@@ -41,15 +47,35 @@ class C147ALitModule(LightningModule):
         self.val_tm_score_best = MeanMetric()
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        net_inputs: Dict[str, torch.Tensor] = {
+            "residue_idx": batch["residue_idx"],
+            "chain_idx": batch["chain_idx"],
+            "copy_idx": batch["copy_idx"],
+            "resid": batch["resid"],
+            "coords": batch["coords"],
+            "mask": batch["mask"],
+            "template_coords": batch.get("template_coords"),
+            "template_mask": batch.get("template_mask"),
+            "template_topk_coords": batch.get("template_topk_coords"),
+            "template_topk_mask": batch.get("template_topk_mask"),
+            "template_topk_valid": batch.get("template_topk_valid"),
+            "template_topk_identity": batch.get("template_topk_identity"),
+            "template_topk_similarity": batch.get("template_topk_similarity"),
+            "template_chunk_coords": batch.get("template_chunk_coords"),
+            "template_chunk_mask": batch.get("template_chunk_mask"),
+            "template_chunk_start": batch.get("template_chunk_start"),
+            "template_chunk_window_valid": batch.get("template_chunk_window_valid"),
+            "template_chunk_valid": batch.get("template_chunk_valid"),
+            "template_chunk_identity": batch.get("template_chunk_identity"),
+            "template_chunk_similarity": batch.get("template_chunk_similarity"),
+        }
+        try:
+            valid_keys = set(inspect.signature(self.net.forward).parameters.keys())
+            net_inputs = {k: v for k, v in net_inputs.items() if k in valid_keys}
+        except (TypeError, ValueError):
+            pass
         return self.net(
-            residue_idx=batch["residue_idx"],
-            chain_idx=batch["chain_idx"],
-            copy_idx=batch["copy_idx"],
-            resid=batch["resid"],
-            coords=batch["coords"],
-            mask=batch["mask"],
-            template_coords=batch.get("template_coords"),
-            template_mask=batch.get("template_mask"),
+            **net_inputs,
         )
 
     def on_train_start(self) -> None:
@@ -64,6 +90,8 @@ class C147ALitModule(LightningModule):
         return max(0.5, 1.24 * (float(n_res) - 15.0) ** (1.0 / 3.0) - 1.8)
 
     def _kabsch_align(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+        target = torch.nan_to_num(target, nan=0.0, posinf=1e4, neginf=-1e4)
         use_fp32_linalg = pred.device.type == "cuda" and (
             pred.dtype in (torch.float16, torch.bfloat16) or torch.is_autocast_enabled()
         )
@@ -108,6 +136,8 @@ class C147ALitModule(LightningModule):
         return aligned
 
     def _tm_score(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+        target = torch.nan_to_num(target, nan=0.0, posinf=1e4, neginf=-1e4)
         n_res = int(pred.shape[0])
         if n_res < 3:
             return pred.new_tensor(0.0)
@@ -116,6 +146,7 @@ class C147ALitModule(LightningModule):
         dist = torch.linalg.norm(pred_aligned - target, dim=-1)
         d0 = self._d0(n_res)
         tm = torch.mean(1.0 / (1.0 + (dist / d0) ** 2))
+        tm = torch.nan_to_num(tm, nan=0.0, posinf=0.0, neginf=0.0)
         return tm.clamp(min=0.0, max=1.0)
 
     def _assign_groups(self, cost: torch.Tensor) -> list[int]:
@@ -124,8 +155,15 @@ class C147ALitModule(LightningModule):
         if n <= 1:
             return list(range(n))
 
+        cost_clean = torch.nan_to_num(
+            cost.detach().to(dtype=torch.float64),
+            nan=1.0,
+            posinf=1e6,
+            neginf=0.0,
+        )
+
         if linear_sum_assignment is not None:
-            row_idx, col_idx = linear_sum_assignment(cost.detach().cpu().numpy())
+            row_idx, col_idx = linear_sum_assignment(cost_clean.cpu().numpy())
             assignment = [0] * n
             for r, c in zip(row_idx.tolist(), col_idx.tolist()):
                 assignment[int(r)] = int(c)
@@ -135,7 +173,7 @@ class C147ALitModule(LightningModule):
         assignment = [-1] * n
         used = set()
         for r in range(n):
-            order = torch.argsort(cost[r]).tolist()
+            order = torch.argsort(cost_clean[r]).tolist()
             for c in order:
                 if c not in used:
                     assignment[r] = int(c)
@@ -149,6 +187,17 @@ class C147ALitModule(LightningModule):
                         used.add(c)
                         break
         return assignment
+
+    def _inverse_log_factor(self, baseline_tm: torch.Tensor) -> torch.Tensor:
+        """Higher factor for low baseline TM, lower (plateaued) factor for high baseline TM."""
+        scale = max(float(self.hparams.must_be_better_log_scale), 1e-6)
+        denom = torch.log(baseline_tm * scale + math.e).clamp(min=1e-6)
+        factor = 1.0 / denom
+        factor = factor.clamp(
+            min=float(self.hparams.must_be_better_min_factor),
+            max=float(self.hparams.must_be_better_max_factor),
+        )
+        return factor
 
     def _permutation_aware_target(
         self,
@@ -203,25 +252,54 @@ class C147ALitModule(LightningModule):
         pred: torch.Tensor,
         target: torch.Tensor,
         mask: torch.Tensor,
+        input_coords: torch.Tensor,
+        template_coords: torch.Tensor,
+        template_mask: torch.Tensor,
         chain_idx: torch.Tensor,
         copy_idx: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Differentiable TM-score for optimization.
         tm_scores_train = []
+        improvement_terms = []
         for b in range(pred.shape[0]):
             valid = mask[b]
             pred_b = pred[b, valid]
             target_b = target[b, valid]
             if pred_b.shape[0] < 3:
                 continue
-            tm_scores_train.append(self._tm_score(pred_b, target_b))
+            tm_pred = self._tm_score(pred_b, target_b)
+            tm_scores_train.append(tm_pred)
+
+            with torch.no_grad():
+                input_b = input_coords[b, valid].to(dtype=torch.float32)
+                target_b_f = target_b.to(dtype=torch.float32)
+                baseline_tm = self._tm_score(input_b, target_b_f)
+
+                template_mask_b = template_mask[b, valid].unsqueeze(-1)
+                if bool(template_mask_b.any()):
+                    template_passthrough_b = torch.where(
+                        template_mask_b,
+                        template_coords[b, valid].to(dtype=torch.float32),
+                        input_b,
+                    )
+                    baseline_tm = torch.maximum(baseline_tm, self._tm_score(template_passthrough_b, target_b_f))
+
+                factor = self._inverse_log_factor(baseline_tm)
+                margin = float(self.hparams.must_be_better_margin)
+                improvement_gap = torch.relu(baseline_tm + margin - tm_pred)
+                improvement_terms.append(factor.to(dtype=improvement_gap.dtype) * improvement_gap)
 
         if tm_scores_train:
             tm_train = torch.stack(tm_scores_train).mean()
         else:
             tm_train = pred.new_tensor(0.0)
 
-        loss = 1.0 - tm_train
+        main_loss = 1.0 - tm_train
+        if improvement_terms:
+            improvement_loss = torch.stack(improvement_terms).mean()
+        else:
+            improvement_loss = pred.new_tensor(0.0)
+        loss = main_loss + float(self.hparams.must_be_better_weight) * improvement_loss
 
         if self.training:
             # Keep train-step logging lightweight.
@@ -257,9 +335,21 @@ class C147ALitModule(LightningModule):
         pred = self.forward(batch)
         target = batch["target_coords"]
         mask = batch["mask"]
+        input_coords = batch["coords"]
+        template_coords = batch["template_coords"]
+        template_mask = batch["template_mask"]
         chain_idx = batch["chain_idx"]
         copy_idx = batch["copy_idx"]
-        return self._masked_losses(pred, target, mask, chain_idx, copy_idx)
+        return self._masked_losses(
+            pred,
+            target,
+            mask,
+            input_coords,
+            template_coords,
+            template_mask,
+            chain_idx,
+            copy_idx,
+        )
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         loss, tm_score = self.model_step(batch)

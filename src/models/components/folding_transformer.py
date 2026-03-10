@@ -26,6 +26,15 @@ class SE3RefinementBlock(nn.Module):
         fmm_max_levels: int = 4,
         fmm_far_topk: int = 32,
         fmm_dynamic_reordering: bool = True,
+        use_block_sparse_attention: bool = False,
+        block_sparse_min_seq_len: int = 1024,
+        block_sparse_block_size: int = 64,
+        block_sparse_window: int = 256,
+        block_sparse_global_stride: int = 128,
+        block_sparse_max_global: int = 64,
+        block_sparse_dilation: int = 1,
+        block_sparse_geo_topk: int = 16,
+        pure_sparse_mode: bool = False,
     ) -> None:
         super().__init__()
         if hidden_dim % num_heads != 0:
@@ -38,6 +47,20 @@ class SE3RefinementBlock(nn.Module):
             raise ValueError("fmm_max_levels must be >= 1")
         if fmm_far_topk < 1:
             raise ValueError("fmm_far_topk must be >= 1")
+        if block_sparse_min_seq_len < 1:
+            raise ValueError("block_sparse_min_seq_len must be >= 1")
+        if block_sparse_block_size < 1:
+            raise ValueError("block_sparse_block_size must be >= 1")
+        if block_sparse_window < 0:
+            raise ValueError("block_sparse_window must be >= 0")
+        if block_sparse_global_stride < 1:
+            raise ValueError("block_sparse_global_stride must be >= 1")
+        if block_sparse_max_global < 1:
+            raise ValueError("block_sparse_max_global must be >= 1")
+        if block_sparse_dilation < 1:
+            raise ValueError("block_sparse_dilation must be >= 1")
+        if block_sparse_geo_topk < 0:
+            raise ValueError("block_sparse_geo_topk must be >= 0")
 
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
@@ -50,6 +73,15 @@ class SE3RefinementBlock(nn.Module):
         self.fmm_max_levels = fmm_max_levels
         self.fmm_far_topk = fmm_far_topk
         self.fmm_dynamic_reordering = fmm_dynamic_reordering
+        self.use_block_sparse_attention = use_block_sparse_attention
+        self.block_sparse_min_seq_len = block_sparse_min_seq_len
+        self.block_sparse_block_size = block_sparse_block_size
+        self.block_sparse_window = block_sparse_window
+        self.block_sparse_global_stride = block_sparse_global_stride
+        self.block_sparse_max_global = block_sparse_max_global
+        self.block_sparse_dilation = block_sparse_dilation
+        self.block_sparse_geo_topk = block_sparse_geo_topk
+        self.pure_sparse_mode = pure_sparse_mode
 
         self.h_norm = nn.LayerNorm(hidden_dim)
         self.ff_norm = nn.LayerNorm(hidden_dim)
@@ -113,6 +145,112 @@ class SE3RefinementBlock(nn.Module):
         attn_mean = attn.mean(dim=1)  # (B, L, L)
         coord_delta = (attn_mean.unsqueeze(-1) * rel).sum(dim=2)  # (B, L, 3)
         return msg, coord_delta
+
+    def _sparse_key_indices(
+        self,
+        n: int,
+        q_start: int,
+        q_end: int,
+        device: torch.device,
+        x_q: Optional[torch.Tensor] = None,
+        x_all: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Select keys for a query block using local window + strided global tokens."""
+        local_start = max(0, q_start - self.block_sparse_window)
+        local_end = min(n, q_end + self.block_sparse_window)
+
+        idx_local = torch.arange(local_start, local_end, self.block_sparse_dilation, device=device)
+        idx_query = torch.arange(q_start, q_end, device=device)
+
+        global_idx = torch.arange(0, n, self.block_sparse_global_stride, device=device)
+        if global_idx.numel() > self.block_sparse_max_global:
+            sel = torch.linspace(
+                0,
+                global_idx.numel() - 1,
+                steps=self.block_sparse_max_global,
+                device=device,
+            )
+            global_idx = global_idx[sel.round().long()]
+
+        key_idx = torch.unique(torch.cat([idx_local, idx_query, global_idx]), sorted=True)
+
+        # Preserve sharp interactions: always include top-k nearest spatial neighbors.
+        if (
+            self.block_sparse_geo_topk > 0
+            and x_q is not None
+            and x_all is not None
+            and x_q.numel() > 0
+            and x_all.numel() > 0
+        ):
+            with torch.no_grad():
+                k_geo = min(self.block_sparse_geo_topk, n)
+                dist = torch.cdist(x_q.to(dtype=torch.float32), x_all.to(dtype=torch.float32))
+                nn_idx = torch.topk(dist, k=k_geo, largest=False, dim=-1).indices.reshape(-1)
+            key_idx = torch.unique(torch.cat([key_idx, nn_idx.to(device=device)]), sorted=True)
+
+        return key_idx
+
+    def _block_sparse_message_and_delta(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        coords: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Block sparse attention with local windows and strided global tokens."""
+        bsz, _, seq_len, _ = q.shape
+        msg_out = torch.zeros(bsz, seq_len, self.hidden_dim, device=q.device, dtype=q.dtype)
+        coord_delta_out = torch.zeros(bsz, seq_len, 3, device=coords.device, dtype=coords.dtype)
+        sqrt_d = self.head_dim**0.5
+        block = self.block_sparse_block_size
+
+        for b in range(bsz):
+            valid_idx = torch.nonzero(mask[b], as_tuple=False).squeeze(-1)
+            n = int(valid_idx.numel())
+            if n == 0:
+                continue
+
+            q_b = q[b, :, valid_idx, :]  # (H, N, D)
+            k_b = k[b, :, valid_idx, :]
+            v_b = v[b, :, valid_idx, :]
+            x_b = coords[b, valid_idx, :]  # (N, 3)
+
+            for q_start in range(0, n, block):
+                q_end = min(q_start + block, n)
+                if q_end <= q_start:
+                    continue
+
+                q_slice = q_b[:, q_start:q_end, :]  # (H, Q, D)
+                x_q = x_b[q_start:q_end, :]  # (Q, 3)
+
+                key_idx = self._sparse_key_indices(
+                    n,
+                    q_start,
+                    q_end,
+                    q.device,
+                    x_q=x_q,
+                    x_all=x_b,
+                )
+                k_sel = k_b[:, key_idx, :]  # (H, K, D)
+                v_sel = v_b[:, key_idx, :]  # (H, K, D)
+                x_k = x_b[key_idx, :]  # (K, 3)
+
+                rel = x_k.unsqueeze(0) - x_q.unsqueeze(1)  # (Q, K, 3)
+                dist = torch.linalg.norm(rel, dim=-1).clamp(min=1e-6)  # (Q, K)
+                logits = torch.matmul(q_slice, k_sel.transpose(-2, -1)) / sqrt_d  # (H, Q, K)
+                logits = logits + self._dist_bias(dist)
+                attn = torch.softmax(logits, dim=-1)
+
+                msg = torch.matmul(attn, v_sel)  # (H, Q, D)
+                attn_mean = attn.mean(dim=0)  # (Q, K)
+                coord_delta = (attn_mean.unsqueeze(-1) * rel).sum(dim=1)  # (Q, 3)
+
+                target_idx = valid_idx[q_start:q_end]
+                msg_out[b, target_idx, :] = msg.transpose(0, 1).reshape(q_end - q_start, self.hidden_dim)
+                coord_delta_out[b, target_idx, :] = coord_delta
+
+        return msg_out, coord_delta_out
 
     def _dynamic_reorder(self, coords: torch.Tensor) -> torch.Tensor:
         """Order residues along the principal spatial axis for sharper local groupings."""
@@ -346,8 +484,14 @@ class SE3RefinementBlock(nn.Module):
         k = self.to_k(h).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.to_v(h).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         valid_lengths = mask.sum(dim=1)
-        use_fmm = self.use_fast_multipole and int(valid_lengths.max().item()) >= self.fmm_exact_threshold
-        if use_fmm:
+        max_valid_len = int(valid_lengths.max().item()) if valid_lengths.numel() > 0 else 0
+        use_sparse = self.pure_sparse_mode or (
+            self.use_block_sparse_attention and max_valid_len >= self.block_sparse_min_seq_len
+        )
+        use_fmm = (not self.pure_sparse_mode) and self.use_fast_multipole and max_valid_len >= self.fmm_exact_threshold
+        if use_sparse:
+            msg, coord_delta = self._block_sparse_message_and_delta(q, k, v, coords, mask)
+        elif use_fmm:
             msg, coord_delta = self._fmm_message_and_delta(q, k, v, coords, mask)
         else:
             msg, coord_delta = self._exact_message_and_delta(q, k, v, coords, mask)
@@ -386,6 +530,15 @@ class SE3FoldingTransformer(nn.Module):
         fmm_max_levels: int = 4,
         fmm_far_topk: int = 32,
         fmm_dynamic_reordering: bool = True,
+        use_block_sparse_attention: bool = False,
+        block_sparse_min_seq_len: int = 1024,
+        block_sparse_block_size: int = 64,
+        block_sparse_window: int = 256,
+        block_sparse_global_stride: int = 128,
+        block_sparse_max_global: int = 64,
+        block_sparse_dilation: int = 1,
+        block_sparse_geo_topk: int = 16,
+        pure_sparse_mode: bool = False,
     ) -> None:
         super().__init__()
         self.recycling_passes = recycling_passes
@@ -413,6 +566,15 @@ class SE3FoldingTransformer(nn.Module):
                     fmm_max_levels=fmm_max_levels,
                     fmm_far_topk=fmm_far_topk,
                     fmm_dynamic_reordering=fmm_dynamic_reordering,
+                    use_block_sparse_attention=use_block_sparse_attention,
+                    block_sparse_min_seq_len=block_sparse_min_seq_len,
+                    block_sparse_block_size=block_sparse_block_size,
+                    block_sparse_window=block_sparse_window,
+                    block_sparse_global_stride=block_sparse_global_stride,
+                    block_sparse_max_global=block_sparse_max_global,
+                    block_sparse_dilation=block_sparse_dilation,
+                    block_sparse_geo_topk=block_sparse_geo_topk,
+                    pure_sparse_mode=pure_sparse_mode,
                 )
                 for _ in range(num_layers)
             ]

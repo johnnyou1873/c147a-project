@@ -1,0 +1,47 @@
+_target_: src.models.c147a_module.C147ALitModule
+
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 0.001
+  weight_decay: 0.0001
+
+scheduler:
+  _target_: torch.optim.lr_scheduler.OneCycleLR
+  _partial_: true
+  max_lr: 0.001
+  pct_start: 0.1
+  anneal_strategy: cos
+  div_factor: 25.0
+  final_div_factor: 1000.0
+
+net:
+  _target_: src.models.template_assembler.TemplateSegmentAssembler
+  hidden_dim: 256
+  num_candidates: 5
+  segment_length: 64
+  segment_stride: 32
+  residue_vocab_size: 5
+  max_chain_embeddings: 64
+  max_copy_embeddings: 64
+  egnn_layers: 1
+  egnn_seq_radius: 2
+  egnn_knn: 16
+  egnn_coord_step_size: 0.1
+  se3_refine_layers: 2
+  se3_num_heads: 4
+  se3_dropout: 0.0
+  se3_coord_step_size: 0.1
+  template_chunk_length: 512
+  template_chunk_stride: 256
+  template_chunk_max_windows: 20
+  hybrid_gru_layers: 2
+  hybrid_gru_dropout: 0.0
+
+compile: false
+use_permutation_aware_metric: true
+must_be_better_weight: 0.5
+must_be_better_margin: 0.01
+must_be_better_log_scale: 8.0
+must_be_better_min_factor: 0.2
+must_be_better_max_factor: 3.0
