@@ -28,10 +28,10 @@ def _format_hms(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def _make_aligner() -> PairwiseAligner:
-    # Mirrors src/kaggle.ipynb scoring for sequence search/adaptation.
+def _make_aligner(mode: str = "local") -> PairwiseAligner:
+    # Mirrors src/kaggle.ipynb search/adaptation scoring.
     aligner = PairwiseAligner()
-    aligner.mode = "global"
+    aligner.mode = str(mode)
     aligner.match_score = 2
     aligner.mismatch_score = -1.5
     aligner.open_gap_score = -8
@@ -48,6 +48,30 @@ def _make_aligner() -> PairwiseAligner:
     ]:
         setattr(aligner, attr, -8 if "open" in attr else -0.4)
     return aligner
+
+
+def _compute_chunk_starts(seq_len: int, chunk_length: int, chunk_stride: int, max_windows: int) -> list[int]:
+    length = max(1, int(chunk_length))
+    stride = max(1, int(chunk_stride))
+    max_w = max(1, int(max_windows))
+    if seq_len <= 0:
+        return []
+
+    starts: list[int] = []
+    start = 0
+    while start < seq_len and len(starts) < max_w:
+        starts.append(start)
+        if start + length >= seq_len:
+            break
+        start += stride
+
+    last_start = max(0, seq_len - length)
+    if last_start not in starts:
+        if len(starts) < max_w:
+            starts.append(last_start)
+        elif starts:
+            starts[-1] = last_start
+    return sorted(set(starts))[:max_w]
 
 
 def _split_target_and_pos(full_id: str) -> tuple[str, int]:
@@ -136,7 +160,7 @@ def _load_sequences_and_coords(
     sequences: dict[str, str] = {}
     coords_by_target: dict[str, np.ndarray] = {}
     for target_id, rows in rows_by_target.items():
-        rows.sort(key=lambda r: (r[0], r[1]))  # ID suffix order, then file order
+        rows.sort(key=lambda r: (r[0], r[1]))  # ID suffix order, then file order.
         seq = "".join(r[2] for r in rows)
         coords = np.asarray([[r[3], r[4], r[5]] for r in rows], dtype=np.float64)
         coords = _fill_missing_coords(coords)
@@ -184,217 +208,185 @@ def _adapt_template_to_query(
     return np.nan_to_num(out, nan=0.0).astype(np.float32)
 
 
-_WORKER_ALIGNER: PairwiseAligner | None = None
+_WORKER_ALIGNER_LOCAL: PairwiseAligner | None = None
 _WORKER_SEQUENCES: dict[str, str] | None = None
 _WORKER_COORDS_BY_TARGET: dict[str, np.ndarray] | None = None
-_WORKER_EXACT_IDX: dict[str, list[str]] | None = None
 _WORKER_VALID_TARGET_IDS: list[str] | None = None
-_WORKER_MIN_PERCENT_IDENTITY = 50.0
-_WORKER_MIN_SIMILARITY = 0.1
-_WORKER_MAX_TEMPLATES = 8
 _WORKER_TOP_K_STORE = 5
-_WORKER_LENGTH_RATIO_TOL = 0.3
 _WORKER_EXCLUDE_SELF = True
 _WORKER_ENFORCE_MIN_TOPK = True
-_WORKER_ALLOW_SELF_FALLBACK = True
+_WORKER_CHUNK_LENGTH = 512
+_WORKER_CHUNK_STRIDE = 256
+_WORKER_CHUNK_MAX_WINDOWS = 20
 
 
 def _init_precompute_worker(
     sequences: dict[str, str],
     coords_by_target: dict[str, np.ndarray],
-    exact_idx: dict[str, list[str]],
     valid_target_ids: list[str],
-    min_percent_identity: float,
-    min_similarity: float,
-    max_templates: int,
     top_k_store: int,
-    length_ratio_tolerance: float,
     exclude_self: bool,
     enforce_min_topk: bool,
-    allow_self_fallback: bool,
+    chunk_length: int,
+    chunk_stride: int,
+    chunk_max_windows: int,
 ) -> None:
-    global _WORKER_ALIGNER
+    global _WORKER_ALIGNER_LOCAL
     global _WORKER_SEQUENCES
     global _WORKER_COORDS_BY_TARGET
-    global _WORKER_EXACT_IDX
     global _WORKER_VALID_TARGET_IDS
-    global _WORKER_MIN_PERCENT_IDENTITY
-    global _WORKER_MIN_SIMILARITY
-    global _WORKER_MAX_TEMPLATES
     global _WORKER_TOP_K_STORE
-    global _WORKER_LENGTH_RATIO_TOL
     global _WORKER_EXCLUDE_SELF
     global _WORKER_ENFORCE_MIN_TOPK
-    global _WORKER_ALLOW_SELF_FALLBACK
+    global _WORKER_CHUNK_LENGTH
+    global _WORKER_CHUNK_STRIDE
+    global _WORKER_CHUNK_MAX_WINDOWS
 
-    _WORKER_ALIGNER = _make_aligner()
+    _WORKER_ALIGNER_LOCAL = _make_aligner(mode="local")
     _WORKER_SEQUENCES = sequences
     _WORKER_COORDS_BY_TARGET = coords_by_target
-    _WORKER_EXACT_IDX = exact_idx
     _WORKER_VALID_TARGET_IDS = valid_target_ids
-    _WORKER_MIN_PERCENT_IDENTITY = float(min_percent_identity)
-    _WORKER_MIN_SIMILARITY = float(min_similarity)
-    _WORKER_MAX_TEMPLATES = int(max_templates)
-    _WORKER_TOP_K_STORE = int(top_k_store)
-    _WORKER_LENGTH_RATIO_TOL = float(length_ratio_tolerance)
+    _WORKER_TOP_K_STORE = max(1, int(top_k_store))
     _WORKER_EXCLUDE_SELF = bool(exclude_self)
     _WORKER_ENFORCE_MIN_TOPK = bool(enforce_min_topk)
-    _WORKER_ALLOW_SELF_FALLBACK = bool(allow_self_fallback)
+    _WORKER_CHUNK_LENGTH = max(1, int(chunk_length))
+    _WORKER_CHUNK_STRIDE = max(1, int(chunk_stride))
+    _WORKER_CHUNK_MAX_WINDOWS = max(1, int(chunk_max_windows))
 
 
-def _compute_single_query_worker(
+def _first_alignment(aligner: PairwiseAligner, query_seq: str, template_seq: str) -> Any | None:
+    try:
+        alns = aligner.align(query_seq, template_seq)
+    except Exception:
+        return None
+    try:
+        if len(alns) <= 0:
+            return None
+    except Exception:
+        pass
+    try:
+        return alns[0]
+    except Exception:
+        return None
+
+
+def _select_topk_chunk_templates(
     query_tid: str,
-) -> tuple[
-    str,
-    np.ndarray,
-    bool,
-    list[str],
-    np.ndarray,
-    np.ndarray,
-    list[str],
-    np.ndarray,
-    np.ndarray,
-    int,
-    int,
-    str,
-]:
-    if _WORKER_ALIGNER is None or _WORKER_SEQUENCES is None or _WORKER_COORDS_BY_TARGET is None:
-        raise RuntimeError("Precompute worker was not initialized.")
-    if _WORKER_EXACT_IDX is None or _WORKER_VALID_TARGET_IDS is None:
-        raise RuntimeError("Precompute worker indices were not initialized.")
-
-    aligner_local = _WORKER_ALIGNER
-    sequences = _WORKER_SEQUENCES
-    coords_by_target = _WORKER_COORDS_BY_TARGET
-    exact_idx = _WORKER_EXACT_IDX
-    valid_target_ids = _WORKER_VALID_TARGET_IDS
-
-    query_seq = sequences[query_tid]
-    q_len = len(query_seq)
+    query_chunk_seq: str,
+    sequences: dict[str, str],
+    valid_target_ids: list[str],
+    aligner_local: PairwiseAligner,
+    exclude_self: bool,
+    top_k_store: int,
+) -> list[tuple[str, float, float, Any]]:
     candidates: list[tuple[str, float, float, Any]] = []
-    used_self_fallback = 0
-    used_repeated_fill = 0
-
-    for tid in exact_idx.get(query_seq, []):
-        if _WORKER_EXCLUDE_SELF and tid == query_tid:
-            continue
-        aln = aligner_local.align(query_seq, sequences[tid])[0]
-        candidates.append((tid, 1.0, 100.0, aln))
+    query_len = len(query_chunk_seq)
+    if query_len <= 0:
+        return []
 
     for template_tid in valid_target_ids:
-        if template_tid == query_tid and _WORKER_EXCLUDE_SELF:
+        if exclude_self and template_tid == query_tid:
             continue
         template_seq = sequences[template_tid]
-        if template_seq == query_seq:
+        if not template_seq:
             continue
-
-        len_ratio = abs(len(template_seq) - q_len) / float(max(len(template_seq), q_len, 1))
-        if len_ratio > _WORKER_LENGTH_RATIO_TOL:
+        aln = _first_alignment(aligner_local, query_chunk_seq, template_seq)
+        if aln is None:
             continue
-
-        aln = aligner_local.align(query_seq, template_seq)[0]
-        norm_similarity = float(aln.score) / float(2.0 * min(q_len, len(template_seq), 1))
-        pct_identity = _compute_identity_percent(query_seq, template_seq, aln)
+        norm_similarity = float(aln.score) / float(2.0 * max(1, query_len))
+        pct_identity = _compute_identity_percent(query_chunk_seq, template_seq, aln)
         candidates.append((template_tid, norm_similarity, pct_identity, aln))
 
     dedup: dict[str, tuple[str, float, float, Any]] = {}
     for item in sorted(candidates, key=lambda x: (x[2], x[1]), reverse=True):
         if item[0] not in dedup:
             dedup[item[0]] = item
-    selected = list(dedup.values())[: int(_WORKER_TOP_K_STORE)]
+    return list(dedup.values())[: int(top_k_store)]
 
-    if _WORKER_ENFORCE_MIN_TOPK and len(selected) < _WORKER_TOP_K_STORE:
-        fallback_item: tuple[str, float, float, Any] | None = None
-        if selected:
-            fallback_item = selected[0]
-            used_repeated_fill = 1
-        elif _WORKER_ALLOW_SELF_FALLBACK:
-            self_aln = aligner_local.align(query_seq, query_seq)[0]
-            fallback_item = (query_tid, 1.0, 100.0, self_aln)
-            used_self_fallback = 1
-        if fallback_item is not None:
-            while len(selected) < _WORKER_TOP_K_STORE:
-                selected.append(fallback_item)
 
-    if not selected:
-        return (
-            query_tid,
-            np.zeros((q_len, 3), dtype=np.float32),
-            False,
-            [],
-            np.zeros((_WORKER_TOP_K_STORE, q_len, 3), dtype=np.float32),
-            np.zeros((_WORKER_TOP_K_STORE,), dtype=np.bool_),
-            [],
-            np.zeros((_WORKER_TOP_K_STORE,), dtype=np.float32),
-            np.zeros((_WORKER_TOP_K_STORE,), dtype=np.float32),
-            used_self_fallback,
-            used_repeated_fill,
-            f"pid:{os.getpid()}",
+def _compute_single_chunk_worker(
+    query_tid: str,
+    window_idx: int,
+    start_idx: int,
+    end_idx: int,
+) -> tuple[
+    str,
+    int,
+    int,
+    int,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    list[str],
+    int,
+    int,
+    str,
+]:
+    if _WORKER_ALIGNER_LOCAL is None:
+        raise RuntimeError("Precompute worker was not initialized.")
+    if _WORKER_SEQUENCES is None or _WORKER_COORDS_BY_TARGET is None or _WORKER_VALID_TARGET_IDS is None:
+        raise RuntimeError("Precompute worker data was not initialized.")
+
+    aligner_local = _WORKER_ALIGNER_LOCAL
+    sequences = _WORKER_SEQUENCES
+    coords_by_target = _WORKER_COORDS_BY_TARGET
+    valid_target_ids = _WORKER_VALID_TARGET_IDS
+
+    query_seq = sequences[query_tid]
+    chunk_len = max(0, min(int(end_idx), len(query_seq)) - int(start_idx))
+    if chunk_len <= 0:
+        raise RuntimeError(f"Invalid chunk bounds for target='{query_tid}', window={window_idx}.")
+    query_chunk_seq = query_seq[int(start_idx) : int(start_idx) + chunk_len]
+
+    used_self_fallback = 0
+    used_repeated_fill = 0
+
+    selected_chunk = _select_topk_chunk_templates(
+        query_tid=query_tid,
+        query_chunk_seq=query_chunk_seq,
+        sequences=sequences,
+        valid_target_ids=valid_target_ids,
+        aligner_local=aligner_local,
+        exclude_self=bool(_WORKER_EXCLUDE_SELF),
+        top_k_store=int(_WORKER_TOP_K_STORE),
+    )
+
+    if _WORKER_ENFORCE_MIN_TOPK and len(selected_chunk) < _WORKER_TOP_K_STORE:
+        raise RuntimeError(
+            f"Chunk template coverage failed for target='{query_tid}', window={window_idx}, "
+            f"valid={len(selected_chunk)}, required={_WORKER_TOP_K_STORE}"
         )
 
-    adapted_coords = []
-    weights = []
-    used_ids = []
-    used_identity = []
-    used_similarity = []
-    for template_tid, sim, pct_identity, aln in selected:
-        adapted = _adapt_template_to_query(
-            query_seq=query_seq,
+    chunk_topk_coords = np.zeros((_WORKER_TOP_K_STORE, _WORKER_CHUNK_LENGTH, 3), dtype=np.float32)
+    chunk_topk_valid = np.zeros((_WORKER_TOP_K_STORE,), dtype=np.bool_)
+    chunk_topk_identity = np.zeros((_WORKER_TOP_K_STORE,), dtype=np.float32)
+    chunk_topk_similarity = np.zeros((_WORKER_TOP_K_STORE,), dtype=np.float32)
+    chunk_topk_sources: list[str] = [""] * _WORKER_TOP_K_STORE
+
+    for k_idx, (template_tid, sim, pct_identity, aln) in enumerate(selected_chunk[: _WORKER_TOP_K_STORE]):
+        adapted_chunk = _adapt_template_to_query(
+            query_seq=query_chunk_seq,
             template_seq=sequences[template_tid],
             template_coords=coords_by_target[template_tid],
             alignment=aln,
         )
-        adapted_coords.append(adapted)
-        weights.append(max(0.0, sim))
-        used_ids.append(template_tid)
-        used_similarity.append(float(sim))
-        used_identity.append(float(pct_identity))
-
-    w = np.asarray(weights, dtype=np.float32)
-    if np.all(w <= 0):
-        w[:] = 1.0
-    w = np.exp(w - np.max(w))
-    w = w / np.sum(w)
-    stacked = np.stack(adapted_coords, axis=0)  # (K, L, 3)
-    consensus = np.tensordot(w, stacked, axes=(0, 0)).astype(np.float32)
-
-    topk_coords = np.zeros((_WORKER_TOP_K_STORE, q_len, 3), dtype=np.float32)
-    topk_valid = np.zeros((_WORKER_TOP_K_STORE,), dtype=np.bool_)
-    topk_id = np.zeros((_WORKER_TOP_K_STORE,), dtype=np.float32)
-    topk_sim = np.zeros((_WORKER_TOP_K_STORE,), dtype=np.float32)
-    topk_ids_used: list[str] = []
-    for k_idx, (coords_k, tid_k, id_k, sim_k) in enumerate(
-        zip(
-            adapted_coords[: _WORKER_TOP_K_STORE],
-            used_ids[: _WORKER_TOP_K_STORE],
-            used_identity[: _WORKER_TOP_K_STORE],
-            used_similarity[: _WORKER_TOP_K_STORE],
-        )
-    ):
-        topk_coords[k_idx] = coords_k.astype(np.float32, copy=False)
-        topk_valid[k_idx] = True
-        topk_id[k_idx] = float(id_k)
-        topk_sim[k_idx] = float(sim_k)
-        topk_ids_used.append(tid_k)
-
-    if _WORKER_ENFORCE_MIN_TOPK:
-        valid_count = int(np.sum(topk_valid))
-        if valid_count < _WORKER_TOP_K_STORE:
-            raise RuntimeError(
-                f"Template coverage guarantee failed for target '{query_tid}': "
-                f"valid={valid_count}, required_valid={_WORKER_TOP_K_STORE}"
-            )
+        chunk_topk_coords[k_idx, :chunk_len] = adapted_chunk[:chunk_len]
+        chunk_topk_valid[k_idx] = True
+        chunk_topk_identity[k_idx] = float(pct_identity)
+        chunk_topk_similarity[k_idx] = float(sim)
+        chunk_topk_sources[k_idx] = template_tid
 
     return (
         query_tid,
-        consensus,
-        True,
-        used_ids,
-        topk_coords,
-        topk_valid,
-        topk_ids_used,
-        topk_id,
-        topk_sim,
+        int(window_idx),
+        int(start_idx),
+        int(chunk_len),
+        chunk_topk_coords,
+        chunk_topk_valid,
+        chunk_topk_identity,
+        chunk_topk_similarity,
+        chunk_topk_sources,
         used_self_fallback,
         used_repeated_fill,
         f"pid:{os.getpid()}",
@@ -404,16 +396,14 @@ def _compute_single_query_worker(
 def precompute_template_coords(
     labels_path: str | Path,
     output_path: str | Path,
-    min_percent_identity: float = 50.0,
-    min_similarity: float = 0.1,
-    max_templates: int = 8,
     top_k_store: int = 5,
     max_residues_per_target: int = 5120,
     max_targets: int | None = None,
-    length_ratio_tolerance: float = 0.3,
     exclude_self: bool = True,
     enforce_min_topk: bool = True,
-    allow_self_fallback: bool = True,
+    chunk_length: int = 512,
+    chunk_stride: int = 256,
+    chunk_max_windows: int = 20,
     num_threads: int = 0,
 ) -> dict[str, Any]:
     labels = Path(labels_path)
@@ -425,33 +415,78 @@ def precompute_template_coords(
         max_residues_per_target=max_residues_per_target,
         max_targets=max_targets,
     )
-
     valid_target_ids = [tid for tid, c in coords_by_target.items() if _coords_are_valid(c)]
-    exact_idx: dict[str, list[str]] = {}
-    for tid in valid_target_ids:
-        exact_idx.setdefault(sequences[tid], []).append(tid)
+
+    top_k_store_i = max(1, int(top_k_store))
+    chunk_length_i = max(1, int(chunk_length))
+    chunk_stride_i = max(1, int(chunk_stride))
+    chunk_max_windows_i = max(1, int(chunk_max_windows))
 
     templates: dict[str, torch.Tensor] = {}
     available: dict[str, bool] = {}
-    sources: dict[str, list[str]] = {}
-    topk_templates: dict[str, torch.Tensor] = {}
-    topk_mask: dict[str, torch.Tensor] = {}
-    topk_sources: dict[str, list[str]] = {}
-    topk_identity: dict[str, torch.Tensor] = {}
-    topk_similarity: dict[str, torch.Tensor] = {}
-    num_targets_with_self_fallback = 0
-    num_targets_with_repeated_templates = 0
+    chunk_topk_templates: dict[str, torch.Tensor] = {}
+    chunk_mask: dict[str, torch.Tensor] = {}
+    chunk_start: dict[str, torch.Tensor] = {}
+    chunk_window_valid: dict[str, torch.Tensor] = {}
+    chunk_topk_valid: dict[str, torch.Tensor] = {}
+    chunk_topk_identity: dict[str, torch.Tensor] = {}
+    chunk_topk_similarity: dict[str, torch.Tensor] = {}
+    chunk_topk_sources: dict[str, list[list[str]]] = {}
+
+    chunk_coords_np: dict[str, np.ndarray] = {}
+    chunk_mask_np: dict[str, np.ndarray] = {}
+    chunk_start_np: dict[str, np.ndarray] = {}
+    chunk_window_valid_np: dict[str, np.ndarray] = {}
+    chunk_valid_np: dict[str, np.ndarray] = {}
+    chunk_identity_np: dict[str, np.ndarray] = {}
+    chunk_similarity_np: dict[str, np.ndarray] = {}
+    chunk_sources_np: dict[str, list[list[str]]] = {}
+
+    target_used_self_fallback: dict[str, bool] = {}
+    target_used_repeated_fill: dict[str, bool] = {}
+    num_chunk_windows_with_self_fallback = 0
+    num_chunk_windows_with_repeated_fill = 0
 
     total_targets = len(valid_target_ids)
+    if total_targets == 0:
+        raise RuntimeError("No valid targets found in labels file for template precompute.")
+
+    chunk_tasks: list[tuple[str, int, int, int]] = []
+    for query_tid in valid_target_ids:
+        q_len = len(sequences[query_tid])
+        starts = _compute_chunk_starts(q_len, chunk_length_i, chunk_stride_i, chunk_max_windows_i)
+
+        chunk_coords_np[query_tid] = np.zeros(
+            (chunk_max_windows_i, top_k_store_i, chunk_length_i, 3),
+            dtype=np.float32,
+        )
+        chunk_mask_np[query_tid] = np.zeros((chunk_max_windows_i, chunk_length_i), dtype=np.bool_)
+        chunk_start_np[query_tid] = np.zeros((chunk_max_windows_i,), dtype=np.int64)
+        chunk_window_valid_np[query_tid] = np.zeros((chunk_max_windows_i,), dtype=np.bool_)
+        chunk_valid_np[query_tid] = np.zeros((chunk_max_windows_i, top_k_store_i), dtype=np.bool_)
+        chunk_identity_np[query_tid] = np.zeros((chunk_max_windows_i, top_k_store_i), dtype=np.float32)
+        chunk_similarity_np[query_tid] = np.zeros((chunk_max_windows_i, top_k_store_i), dtype=np.float32)
+        chunk_sources_np[query_tid] = [[""] * top_k_store_i for _ in range(chunk_max_windows_i)]
+        target_used_self_fallback[query_tid] = False
+        target_used_repeated_fill[query_tid] = False
+
+        for window_idx, start_idx in enumerate(starts):
+            end_idx = min(start_idx + chunk_length_i, q_len)
+            if end_idx <= start_idx:
+                continue
+            chunk_tasks.append((query_tid, int(window_idx), int(start_idx), int(end_idx)))
+
+    total_chunk_tasks = len(chunk_tasks)
+    if total_chunk_tasks == 0:
+        raise RuntimeError("No valid chunk windows were generated for template precompute.")
+
     requested_threads = int(num_threads)
-    if requested_threads <= 0:
-        worker_threads = min(16, max(1, os.cpu_count() or 1))
-    else:
-        worker_threads = max(1, requested_threads)
-    worker_threads = min(worker_threads, max(1, total_targets))
+    worker_threads = min(16, max(1, os.cpu_count() or 1)) if requested_threads <= 0 else max(1, requested_threads)
+    worker_threads = min(worker_threads, max(1, total_chunk_tasks))
+
     worker_ids_seen: set[str] = set()
     progress_start = time.perf_counter()
-    progress_every = max(1, min(250, total_targets // 100 if total_targets >= 100 else 10))
+    progress_every = max(1, min(500, total_chunk_tasks // 100 if total_chunk_tasks >= 100 else 20))
     last_logged_done = 0
 
     def _log_progress(done: int, force: bool = False) -> None:
@@ -462,13 +497,13 @@ def precompute_template_coords(
             return
         elapsed = time.perf_counter() - progress_start
         rate = done / max(elapsed, 1e-9)
-        remaining = max(0, total_targets - done)
+        remaining = max(0, total_chunk_tasks - done)
         eta = remaining / max(rate, 1e-9)
-        pct = 100.0 * float(done) / float(max(1, total_targets))
+        pct = 100.0 * float(done) / float(max(1, total_chunk_tasks))
         log.info(
-            "Template precompute progress: %d/%d (%.1f%%) elapsed=%s eta=%s rate=%.2f targets/s",
+            "Template precompute progress: %d/%d chunks (%.1f%%) elapsed=%s eta=%s rate=%.2f chunks/s",
             done,
-            total_targets,
+            total_chunk_tasks,
             pct,
             _format_hms(elapsed),
             _format_hms(eta),
@@ -476,100 +511,142 @@ def precompute_template_coords(
         )
         last_logged_done = done
 
-    def _store_query_result(
+    def _store_chunk_result(
         result: tuple[
             str,
+            int,
+            int,
+            int,
             np.ndarray,
-            bool,
+            np.ndarray,
+            np.ndarray,
+            np.ndarray,
             list[str],
-            np.ndarray,
-            np.ndarray,
-            list[str],
-            np.ndarray,
-            np.ndarray,
             int,
             int,
             str,
         ]
     ) -> None:
-        nonlocal num_targets_with_self_fallback, num_targets_with_repeated_templates
+        nonlocal num_chunk_windows_with_self_fallback, num_chunk_windows_with_repeated_fill
         (
             query_tid,
-            template_tensor,
-            is_available,
-            source_ids,
-            topk_tensor,
-            topk_valid_tensor,
-            topk_source_ids,
-            topk_id_tensor,
-            topk_sim_tensor,
+            window_idx,
+            start_idx,
+            chunk_len,
+            chunk_tensor,
+            chunk_valid_tensor,
+            chunk_id_tensor,
+            chunk_sim_tensor,
+            chunk_source_ids,
             self_fallback_flag,
             repeated_fill_flag,
             worker_name,
         ) = result
         worker_ids_seen.add(worker_name)
-        templates[query_tid] = torch.from_numpy(template_tensor.astype(np.float32, copy=False))
-        available[query_tid] = bool(is_available)
-        sources[query_tid] = source_ids
-        topk_templates[query_tid] = torch.from_numpy(topk_tensor.astype(np.float32, copy=False))
-        topk_mask[query_tid] = torch.from_numpy(topk_valid_tensor.astype(np.bool_, copy=False))
-        topk_sources[query_tid] = topk_source_ids
-        topk_identity[query_tid] = torch.from_numpy(topk_id_tensor.astype(np.float32, copy=False))
-        topk_similarity[query_tid] = torch.from_numpy(topk_sim_tensor.astype(np.float32, copy=False))
-        num_targets_with_self_fallback += int(self_fallback_flag)
-        num_targets_with_repeated_templates += int(repeated_fill_flag)
+        chunk_coords_np[query_tid][window_idx] = chunk_tensor.astype(np.float32, copy=False)
+        chunk_valid_np[query_tid][window_idx] = chunk_valid_tensor.astype(np.bool_, copy=False)
+        chunk_identity_np[query_tid][window_idx] = chunk_id_tensor.astype(np.float32, copy=False)
+        chunk_similarity_np[query_tid][window_idx] = chunk_sim_tensor.astype(np.float32, copy=False)
+        chunk_sources_np[query_tid][window_idx] = list(chunk_source_ids)
+        chunk_start_np[query_tid][window_idx] = int(start_idx)
+        chunk_window_valid_np[query_tid][window_idx] = True
+        chunk_mask_np[query_tid][window_idx, : int(chunk_len)] = True
+
+        if int(self_fallback_flag) > 0:
+            target_used_self_fallback[query_tid] = True
+            num_chunk_windows_with_self_fallback += 1
+        if int(repeated_fill_flag) > 0:
+            target_used_repeated_fill[query_tid] = True
+            num_chunk_windows_with_repeated_fill += 1
 
     log.info(
-        "Template precompute started for %d targets using %d process(es).",
+        "Template precompute started for %d targets (%d chunks) using %d process(es) in chunk-parallel mode (alignment=local).",
         total_targets,
+        total_chunk_tasks,
         worker_threads,
     )
 
-    if worker_threads > 1 and total_targets > 1:
+    if worker_threads > 1 and total_chunk_tasks > 1:
         with ProcessPoolExecutor(
             max_workers=worker_threads,
             initializer=_init_precompute_worker,
             initargs=(
                 sequences,
                 coords_by_target,
-                exact_idx,
                 valid_target_ids,
-                float(min_percent_identity),
-                float(min_similarity),
-                int(max_templates),
-                int(top_k_store),
-                float(length_ratio_tolerance),
+                int(top_k_store_i),
                 bool(exclude_self),
                 bool(enforce_min_topk),
-                bool(allow_self_fallback),
+                int(chunk_length_i),
+                int(chunk_stride_i),
+                int(chunk_max_windows_i),
             ),
         ) as executor:
-            futures = [executor.submit(_compute_single_query_worker, query_tid) for query_tid in valid_target_ids]
+            futures = [executor.submit(_compute_single_chunk_worker, *task) for task in chunk_tasks]
             done = 0
             for future in as_completed(futures):
-                _store_query_result(future.result())
+                _store_chunk_result(future.result())
                 done += 1
                 _log_progress(done)
             _log_progress(done, force=True)
     else:
         _init_precompute_worker(
-            sequences,
-            coords_by_target,
-            exact_idx,
-            valid_target_ids,
-            float(min_percent_identity),
-            float(min_similarity),
-            int(max_templates),
-            int(top_k_store),
-            float(length_ratio_tolerance),
-            bool(exclude_self),
-            bool(enforce_min_topk),
-            bool(allow_self_fallback),
+            sequences=sequences,
+            coords_by_target=coords_by_target,
+            valid_target_ids=valid_target_ids,
+            top_k_store=int(top_k_store_i),
+            exclude_self=bool(exclude_self),
+            enforce_min_topk=bool(enforce_min_topk),
+            chunk_length=int(chunk_length_i),
+            chunk_stride=int(chunk_stride_i),
+            chunk_max_windows=int(chunk_max_windows_i),
         )
-        for idx, query_tid in enumerate(valid_target_ids, start=1):
-            _store_query_result(_compute_single_query_worker(query_tid))
+        for idx, task in enumerate(chunk_tasks, start=1):
+            _store_chunk_result(_compute_single_chunk_worker(*task))
             _log_progress(idx)
-        _log_progress(total_targets, force=True)
+        _log_progress(total_chunk_tasks, force=True)
+
+    for query_tid in valid_target_ids:
+        q_len = len(sequences[query_tid])
+        consensus = np.zeros((q_len, 3), dtype=np.float32)
+        weight_sum = np.zeros((q_len, 1), dtype=np.float32)
+
+        c_coords = chunk_coords_np[query_tid]
+        c_mask = chunk_mask_np[query_tid]
+        c_start = chunk_start_np[query_tid]
+        c_window_valid = chunk_window_valid_np[query_tid]
+        c_valid = chunk_valid_np[query_tid]
+        c_sim = chunk_similarity_np[query_tid]
+
+        for w_idx in range(chunk_max_windows_i):
+            if not bool(c_window_valid[w_idx]):
+                continue
+            start_idx = int(c_start[w_idx])
+            win_len = int(np.sum(c_mask[w_idx]))
+            end_idx = min(q_len, start_idx + win_len)
+            if end_idx <= start_idx:
+                continue
+            seg_len = end_idx - start_idx
+            for k_idx in range(top_k_store_i):
+                if not bool(c_valid[w_idx, k_idx]):
+                    continue
+                weight = max(1e-4, float(c_sim[w_idx, k_idx]))
+                consensus[start_idx:end_idx] += weight * c_coords[w_idx, k_idx, :seg_len]
+                weight_sum[start_idx:end_idx] += weight
+
+        consensus = np.where(weight_sum > 0.0, consensus / np.maximum(weight_sum, 1e-6), consensus)
+        is_available = bool(np.any(c_valid))
+
+        templates[query_tid] = torch.from_numpy(consensus.astype(np.float32, copy=False))
+        available[query_tid] = is_available
+        chunk_topk_templates[query_tid] = torch.from_numpy(c_coords.astype(np.float32, copy=False))
+        chunk_mask[query_tid] = torch.from_numpy(c_mask.astype(np.bool_, copy=False))
+        chunk_start[query_tid] = torch.from_numpy(c_start.astype(np.int64, copy=False))
+        chunk_window_valid[query_tid] = torch.from_numpy(c_window_valid.astype(np.bool_, copy=False))
+        chunk_topk_valid[query_tid] = torch.from_numpy(c_valid.astype(np.bool_, copy=False))
+        chunk_topk_identity[query_tid] = torch.from_numpy(chunk_identity_np[query_tid].astype(np.float32, copy=False))
+        chunk_topk_similarity[query_tid] = torch.from_numpy(c_sim.astype(np.float32, copy=False))
+        chunk_topk_sources[query_tid] = [list(row) for row in chunk_sources_np[query_tid]]
 
     used_workers = len(worker_ids_seen)
     log.info(
@@ -577,48 +654,49 @@ def precompute_template_coords(
         used_workers,
         worker_threads,
     )
-    if used_workers < worker_threads and total_targets >= worker_threads:
-        log.warning(
-            "Precompute used fewer processes than requested (used=%d, requested=%d). "
-            "This can indicate startup overhead or workload imbalance.",
-            used_workers,
-            worker_threads,
-        )
+
+    num_targets_with_self_fallback = int(sum(1 for v in target_used_self_fallback.values() if v))
+    num_targets_with_repeated_templates = int(sum(1 for v in target_used_repeated_fill.values() if v))
 
     payload = {
         "templates": templates,
         "available": available,
-        "sources": sources,
-        "topk_templates": topk_templates,
-        "topk_mask": topk_mask,
-        "topk_sources": topk_sources,
-        "topk_identity": topk_identity,
-        "topk_similarity": topk_similarity,
+        "chunk_topk_templates": chunk_topk_templates,
+        "chunk_mask": chunk_mask,
+        "chunk_start": chunk_start,
+        "chunk_window_valid": chunk_window_valid,
+        "chunk_topk_valid": chunk_topk_valid,
+        "chunk_topk_identity": chunk_topk_identity,
+        "chunk_topk_similarity": chunk_topk_similarity,
+        "chunk_topk_sources": chunk_topk_sources,
         "meta": {
             "labels_path": str(labels.resolve()),
-            "min_percent_identity": float(min_percent_identity),
-            "min_similarity": float(min_similarity),
-            "selection_policy": "topk_non_self_by_identity_similarity_no_threshold",
-            "max_templates": int(max_templates),
-            "top_k_store": int(top_k_store),
+            "chunk_selection_policy": "chunked_topk_non_self_by_identity_similarity_no_threshold",
+            "alignment_mode": "local",
+            "top_k_store": int(top_k_store_i),
             "max_residues_per_target": int(max_residues_per_target),
             "max_targets": None if max_targets is None else int(max_targets),
-            "length_ratio_tolerance": float(length_ratio_tolerance),
             "exclude_self": bool(exclude_self),
             "enforce_min_topk": bool(enforce_min_topk),
-            "allow_self_fallback": bool(allow_self_fallback),
-            "num_targets": int(len(valid_target_ids)),
+            "allow_self_fallback": False,
+            "chunk_length": int(chunk_length_i),
+            "chunk_stride": int(chunk_stride_i),
+            "chunk_max_windows": int(chunk_max_windows_i),
+            "num_targets": int(total_targets),
+            "num_chunk_tasks": int(total_chunk_tasks),
             "num_threads": int(worker_threads),
-            "executor_type": "process",
+            "executor_type": "process_chunk_parallel",
             "num_targets_with_self_fallback": int(num_targets_with_self_fallback),
             "num_targets_with_repeated_templates": int(num_targets_with_repeated_templates),
+            "num_chunk_windows_with_self_fallback": int(num_chunk_windows_with_self_fallback),
+            "num_chunk_windows_with_repeated_fill": int(num_chunk_windows_with_repeated_fill),
         },
     }
     torch.save(payload, output)
     log.info(
-        "Saved template coordinates to %s (targets=%d, self_fallback=%d, repeated_fill=%d)",
+        "Saved chunk template payload to %s (targets=%d, self_fallback=%d, repeated_fill=%d).",
         output,
-        len(valid_target_ids),
+        total_targets,
         num_targets_with_self_fallback,
         num_targets_with_repeated_templates,
     )
@@ -626,19 +704,19 @@ def precompute_template_coords(
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Precompute template coordinates from train_labels.csv")
+    parser = argparse.ArgumentParser(description="Precompute chunked templates from train_labels.csv")
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--labels-file", type=str, default="train_labels.csv")
     parser.add_argument("--output-file", type=str, default="template_coords.pt")
-    parser.add_argument("--min-percent-identity", type=float, default=50.0)
-    parser.add_argument("--min-similarity", type=float, default=0.1)
-    parser.add_argument("--max-templates", type=int, default=8)
     parser.add_argument("--top-k-store", type=int, default=5)
     parser.add_argument("--max-residues-per-target", type=int, default=5120)
     parser.add_argument("--max-targets", type=int, default=0)
-    parser.add_argument("--length-ratio-tolerance", type=float, default=0.3)
+    parser.add_argument("--chunk-length", type=int, default=512)
+    parser.add_argument("--chunk-stride", type=int, default=256)
+    parser.add_argument("--chunk-max-windows", type=int, default=20)
     parser.add_argument("--num-threads", type=int, default=0)
     parser.add_argument("--include-self", action="store_true", help="Allow self-target as template.")
+    parser.add_argument("--disable-enforce-min-topk", action="store_true", help="Do not enforce exact top-K coverage.")
     return parser
 
 
@@ -654,14 +732,14 @@ def main() -> None:
     precompute_template_coords(
         labels_path=labels_path,
         output_path=output_path,
-        min_percent_identity=args.min_percent_identity,
-        min_similarity=args.min_similarity,
-        max_templates=args.max_templates,
         top_k_store=args.top_k_store,
         max_residues_per_target=args.max_residues_per_target,
         max_targets=max_targets,
-        length_ratio_tolerance=args.length_ratio_tolerance,
         exclude_self=not args.include_self,
+        enforce_min_topk=not args.disable_enforce_min_topk,
+        chunk_length=args.chunk_length,
+        chunk_stride=args.chunk_stride,
+        chunk_max_windows=args.chunk_max_windows,
         num_threads=args.num_threads,
     )
 

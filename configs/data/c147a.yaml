@@ -4,7 +4,7 @@ labels_file: train_labels.csv
 batch_size: 4
 num_workers: 8
 pin_memory: False
-persistent_workers: False
+persistent_workers: True
 train_fraction: 0.95
 val_fraction: 0.05
 max_residues_per_target: 5120
@@ -17,7 +17,7 @@ eval_use_template_only_inputs: true
 use_template_coords: true
 template_file: template_coords.pt
 precompute_templates_if_missing: true
-template_precompute_num_threads: 12
+template_precompute_num_threads: 22
 template_min_percent_identity: 50.0
 template_min_similarity: 0.1
 template_max_templates: 8

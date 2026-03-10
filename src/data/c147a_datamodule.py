@@ -36,6 +36,13 @@ class RNAExample:
     template_topk_valid: torch.Tensor  # (K,)
     template_topk_identity: torch.Tensor  # (K,)
     template_topk_similarity: torch.Tensor  # (K,)
+    template_chunk_coords: torch.Tensor  # (W, K, C, 3)
+    template_chunk_mask: torch.Tensor  # (W, C)
+    template_chunk_start: torch.Tensor  # (W,)
+    template_chunk_window_valid: torch.Tensor  # (W,)
+    template_chunk_valid: torch.Tensor  # (W, K)
+    template_chunk_identity: torch.Tensor  # (W, K)
+    template_chunk_similarity: torch.Tensor  # (W, K)
     has_template: bool
 
 
@@ -47,11 +54,16 @@ class RNAIdentityDataset(Dataset[RNAExample]):
         max_targets: Optional[int] = 256,
         template_coords_by_target: Optional[dict[str, torch.Tensor]] = None,
         template_available_by_target: Optional[dict[str, bool]] = None,
-        template_topk_coords_by_target: Optional[dict[str, torch.Tensor]] = None,
-        template_topk_valid_by_target: Optional[dict[str, torch.Tensor]] = None,
-        template_topk_identity_by_target: Optional[dict[str, torch.Tensor]] = None,
-        template_topk_similarity_by_target: Optional[dict[str, torch.Tensor]] = None,
+        template_chunk_coords_by_target: Optional[dict[str, torch.Tensor]] = None,
+        template_chunk_mask_by_target: Optional[dict[str, torch.Tensor]] = None,
+        template_chunk_start_by_target: Optional[dict[str, torch.Tensor]] = None,
+        template_chunk_window_valid_by_target: Optional[dict[str, torch.Tensor]] = None,
+        template_chunk_valid_by_target: Optional[dict[str, torch.Tensor]] = None,
+        template_chunk_identity_by_target: Optional[dict[str, torch.Tensor]] = None,
+        template_chunk_similarity_by_target: Optional[dict[str, torch.Tensor]] = None,
         template_topk_count: int = 5,
+        template_chunk_length: int = 512,
+        template_chunk_max_windows: int = 20,
         template_min_percent_identity: float = 50.0,
         enforce_template_coverage: bool = True,
     ) -> None:
@@ -60,11 +72,16 @@ class RNAIdentityDataset(Dataset[RNAExample]):
         self.max_targets = max_targets
         self.template_coords_by_target = template_coords_by_target or {}
         self.template_available_by_target = template_available_by_target or {}
-        self.template_topk_coords_by_target = template_topk_coords_by_target or {}
-        self.template_topk_valid_by_target = template_topk_valid_by_target or {}
-        self.template_topk_identity_by_target = template_topk_identity_by_target or {}
-        self.template_topk_similarity_by_target = template_topk_similarity_by_target or {}
+        self.template_chunk_coords_by_target = template_chunk_coords_by_target or {}
+        self.template_chunk_mask_by_target = template_chunk_mask_by_target or {}
+        self.template_chunk_start_by_target = template_chunk_start_by_target or {}
+        self.template_chunk_window_valid_by_target = template_chunk_window_valid_by_target or {}
+        self.template_chunk_valid_by_target = template_chunk_valid_by_target or {}
+        self.template_chunk_identity_by_target = template_chunk_identity_by_target or {}
+        self.template_chunk_similarity_by_target = template_chunk_similarity_by_target or {}
         self.template_topk_count = max(1, int(template_topk_count))
+        self.template_chunk_length = max(1, int(template_chunk_length))
+        self.template_chunk_max_windows = max(1, int(template_chunk_max_windows))
         self.template_min_percent_identity = float(template_min_percent_identity)
         self.enforce_template_coverage = bool(enforce_template_coverage)
         self.examples, self.num_chain_types, self.max_copy_number, self.num_examples_with_template = self._load_examples()
@@ -132,6 +149,25 @@ class RNAIdentityDataset(Dataset[RNAExample]):
             template_topk_valid = torch.zeros((self.template_topk_count,), dtype=torch.bool)
             template_topk_identity = torch.zeros((self.template_topk_count,), dtype=torch.float32)
             template_topk_similarity = torch.zeros((self.template_topk_count,), dtype=torch.float32)
+            template_chunk_coords = torch.zeros(
+                (self.template_chunk_max_windows, self.template_topk_count, self.template_chunk_length, 3),
+                dtype=torch.float32,
+            )
+            template_chunk_mask = torch.zeros(
+                (self.template_chunk_max_windows, self.template_chunk_length),
+                dtype=torch.bool,
+            )
+            template_chunk_start = torch.zeros((self.template_chunk_max_windows,), dtype=torch.long)
+            template_chunk_window_valid = torch.zeros((self.template_chunk_max_windows,), dtype=torch.bool)
+            template_chunk_valid = torch.zeros((self.template_chunk_max_windows, self.template_topk_count), dtype=torch.bool)
+            template_chunk_identity = torch.zeros(
+                (self.template_chunk_max_windows, self.template_topk_count),
+                dtype=torch.float32,
+            )
+            template_chunk_similarity = torch.zeros(
+                (self.template_chunk_max_windows, self.template_topk_count),
+                dtype=torch.float32,
+            )
             has_template = False
             if target_id in self.template_coords_by_target:
                 tmpl = self.template_coords_by_target[target_id].detach().to(dtype=torch.float32, device="cpu")
@@ -143,62 +179,111 @@ class RNAIdentityDataset(Dataset[RNAExample]):
                         template_coords[: tmpl.shape[0]] = tmpl
                     has_template = bool(self.template_available_by_target.get(target_id, True))
 
-            if target_id in self.template_topk_coords_by_target:
-                tmpl_topk = self.template_topk_coords_by_target[target_id].detach().to(dtype=torch.float32, device="cpu")
-                if tmpl_topk.ndim == 3 and tmpl_topk.shape[-1] == 3:
-                    k_take = min(self.template_topk_count, tmpl_topk.shape[0])
-                    seq_len = coords_t.shape[0]
-                    if tmpl_topk.shape[1] >= seq_len:
-                        template_topk_coords[:k_take] = tmpl_topk[:k_take, :seq_len]
-                    else:
-                        template_topk_coords[:k_take, : tmpl_topk.shape[1]] = tmpl_topk[:k_take]
+            if target_id in self.template_chunk_coords_by_target:
+                chunk_coords_raw = self.template_chunk_coords_by_target[target_id].detach().to(
+                    dtype=torch.float32, device="cpu"
+                )
+                if chunk_coords_raw.ndim == 5 and chunk_coords_raw.shape[-1] == 3:
+                    w_take = min(self.template_chunk_max_windows, int(chunk_coords_raw.shape[0]))
+                    k_take = min(self.template_topk_count, int(chunk_coords_raw.shape[1]))
+                    c_take = min(self.template_chunk_length, int(chunk_coords_raw.shape[2]))
+                    template_chunk_coords[:w_take, :k_take, :c_take] = chunk_coords_raw[:w_take, :k_take, :c_take]
 
-                    valid_topk = self.template_topk_valid_by_target.get(target_id, None)
-                    if isinstance(valid_topk, torch.Tensor) and valid_topk.numel() > 0:
-                        valid_topk_t = valid_topk.detach().to(dtype=torch.bool, device="cpu")
-                        template_topk_valid[: min(k_take, valid_topk_t.numel())] = valid_topk_t[:k_take]
-                    else:
-                        template_topk_valid[:k_take] = True
+                chunk_mask_raw = self.template_chunk_mask_by_target.get(target_id, None)
+                if isinstance(chunk_mask_raw, torch.Tensor) and chunk_mask_raw.numel() > 0:
+                    chunk_mask_t = chunk_mask_raw.detach().to(dtype=torch.bool, device="cpu")
+                    if chunk_mask_t.ndim == 2:
+                        w_take = min(self.template_chunk_max_windows, int(chunk_mask_t.shape[0]))
+                        c_take = min(self.template_chunk_length, int(chunk_mask_t.shape[1]))
+                        template_chunk_mask[:w_take, :c_take] = chunk_mask_t[:w_take, :c_take]
 
-                    identity_topk = self.template_topk_identity_by_target.get(target_id, None)
-                    if isinstance(identity_topk, torch.Tensor) and identity_topk.numel() > 0:
-                        identity_topk_t = identity_topk.detach().to(dtype=torch.float32, device="cpu")
-                        template_topk_identity[: min(k_take, identity_topk_t.numel())] = identity_topk_t[:k_take]
+                chunk_start_raw = self.template_chunk_start_by_target.get(target_id, None)
+                if isinstance(chunk_start_raw, torch.Tensor) and chunk_start_raw.numel() > 0:
+                    chunk_start_t = chunk_start_raw.detach().to(dtype=torch.long, device="cpu")
+                    if chunk_start_t.ndim == 1:
+                        w_take = min(self.template_chunk_max_windows, int(chunk_start_t.shape[0]))
+                        template_chunk_start[:w_take] = chunk_start_t[:w_take]
 
-                    similarity_topk = self.template_topk_similarity_by_target.get(target_id, None)
-                    if isinstance(similarity_topk, torch.Tensor) and similarity_topk.numel() > 0:
-                        similarity_topk_t = similarity_topk.detach().to(dtype=torch.float32, device="cpu")
-                        template_topk_similarity[: min(k_take, similarity_topk_t.numel())] = similarity_topk_t[:k_take]
+                chunk_window_valid_raw = self.template_chunk_window_valid_by_target.get(target_id, None)
+                if isinstance(chunk_window_valid_raw, torch.Tensor) and chunk_window_valid_raw.numel() > 0:
+                    chunk_window_valid_t = chunk_window_valid_raw.detach().to(dtype=torch.bool, device="cpu")
+                    if chunk_window_valid_t.ndim == 1:
+                        w_take = min(self.template_chunk_max_windows, int(chunk_window_valid_t.shape[0]))
+                        template_chunk_window_valid[:w_take] = chunk_window_valid_t[:w_take]
+
+                chunk_valid_raw = self.template_chunk_valid_by_target.get(target_id, None)
+                if isinstance(chunk_valid_raw, torch.Tensor) and chunk_valid_raw.numel() > 0:
+                    chunk_valid_t = chunk_valid_raw.detach().to(dtype=torch.bool, device="cpu")
+                    if chunk_valid_t.ndim == 2:
+                        w_take = min(self.template_chunk_max_windows, int(chunk_valid_t.shape[0]))
+                        k_take = min(self.template_topk_count, int(chunk_valid_t.shape[1]))
+                        template_chunk_valid[:w_take, :k_take] = chunk_valid_t[:w_take, :k_take]
+
+                chunk_identity_raw = self.template_chunk_identity_by_target.get(target_id, None)
+                if isinstance(chunk_identity_raw, torch.Tensor) and chunk_identity_raw.numel() > 0:
+                    chunk_identity_t = chunk_identity_raw.detach().to(dtype=torch.float32, device="cpu")
+                    if chunk_identity_t.ndim == 2:
+                        w_take = min(self.template_chunk_max_windows, int(chunk_identity_t.shape[0]))
+                        k_take = min(self.template_topk_count, int(chunk_identity_t.shape[1]))
+                        template_chunk_identity[:w_take, :k_take] = chunk_identity_t[:w_take, :k_take]
+
+                chunk_similarity_raw = self.template_chunk_similarity_by_target.get(target_id, None)
+                if isinstance(chunk_similarity_raw, torch.Tensor) and chunk_similarity_raw.numel() > 0:
+                    chunk_similarity_t = chunk_similarity_raw.detach().to(dtype=torch.float32, device="cpu")
+                    if chunk_similarity_t.ndim == 2:
+                        w_take = min(self.template_chunk_max_windows, int(chunk_similarity_t.shape[0]))
+                        k_take = min(self.template_topk_count, int(chunk_similarity_t.shape[1]))
+                        template_chunk_similarity[:w_take, :k_take] = chunk_similarity_t[:w_take, :k_take]
 
             if self.enforce_template_coverage:
-                qualified = template_topk_valid.clone()
-                qualified_count = int(qualified.sum().item())
-                # Never backfill from query/ground-truth coordinates. If coverage is low but at least
-                # one real template exists, repeat the best available template candidate.
-                if 0 < qualified_count < self.template_topk_count:
-                    qualified_idx = torch.nonzero(qualified, as_tuple=False).squeeze(-1)
-                    best_local = int(torch.argmax(template_topk_identity[qualified_idx]).item())
-                    best_idx = int(qualified_idx[best_local].item())
-                    fill_coords = template_topk_coords[best_idx].clone()
-                    fill_identity = float(template_topk_identity[best_idx].item())
-                    fill_similarity = float(template_topk_similarity[best_idx].item())
+                active_windows = torch.nonzero(template_chunk_window_valid, as_tuple=False).squeeze(-1)
+                for w_idx_t in active_windows:
+                    w_idx = int(w_idx_t.item())
+                    qualified = template_chunk_valid[w_idx].clone()
+                    qualified_count = int(qualified.sum().item())
+                    if 0 < qualified_count < self.template_topk_count:
+                        qualified_idx = torch.nonzero(qualified, as_tuple=False).squeeze(-1)
+                        best_local = int(torch.argmax(template_chunk_identity[w_idx, qualified_idx]).item())
+                        best_idx = int(qualified_idx[best_local].item())
+                        fill_coords = template_chunk_coords[w_idx, best_idx].clone()
+                        fill_identity = float(template_chunk_identity[w_idx, best_idx].item())
+                        fill_similarity = float(template_chunk_similarity[w_idx, best_idx].item())
+                        for k_idx in range(self.template_topk_count):
+                            if qualified_count >= self.template_topk_count:
+                                break
+                            if bool(qualified[k_idx].item()):
+                                continue
+                            template_chunk_coords[w_idx, k_idx] = fill_coords
+                            template_chunk_valid[w_idx, k_idx] = True
+                            template_chunk_identity[w_idx, k_idx] = fill_identity
+                            template_chunk_similarity[w_idx, k_idx] = fill_similarity
+                            qualified[k_idx] = True
+                            qualified_count += 1
 
-                    for k_idx in range(self.template_topk_count):
-                        if qualified_count >= self.template_topk_count:
-                            break
-                        if bool(qualified[k_idx].item()):
-                            continue
-                        template_topk_coords[k_idx] = fill_coords
-                        template_topk_valid[k_idx] = True
-                        template_topk_identity[k_idx] = fill_identity
-                        template_topk_similarity[k_idx] = fill_similarity
-                        qualified[k_idx] = True
-                        qualified_count += 1
-
-            qualified = template_topk_valid.clone()
-            has_template = bool(has_template or bool(qualified.any().item()))
-            if has_template and not bool((template_coords.abs().sum() > 0).item()) and bool(qualified.any().item()):
-                template_coords = template_topk_coords[qualified][0].clone()
+            (
+                rebuilt_template_coords,
+                rebuilt_topk_coords,
+                rebuilt_topk_valid,
+                rebuilt_topk_identity,
+                rebuilt_topk_similarity,
+                rebuilt_has_template,
+            ) = _rebuild_template_views_from_chunks(
+                seq_len=int(coords_t.shape[0]),
+                chunk_coords=template_chunk_coords,
+                chunk_mask=template_chunk_mask,
+                chunk_start=template_chunk_start,
+                chunk_window_valid=template_chunk_window_valid,
+                chunk_valid=template_chunk_valid,
+                chunk_identity=template_chunk_identity,
+                chunk_similarity=template_chunk_similarity,
+                topk_count=self.template_topk_count,
+            )
+            template_coords = rebuilt_template_coords
+            template_topk_coords = rebuilt_topk_coords
+            template_topk_valid = rebuilt_topk_valid
+            template_topk_identity = rebuilt_topk_identity
+            template_topk_similarity = rebuilt_topk_similarity
+            has_template = bool(has_template or rebuilt_has_template)
 
             if has_template:
                 num_examples_with_template += 1
@@ -216,6 +301,13 @@ class RNAIdentityDataset(Dataset[RNAExample]):
                     template_topk_valid=template_topk_valid,
                     template_topk_identity=template_topk_identity,
                     template_topk_similarity=template_topk_similarity,
+                    template_chunk_coords=template_chunk_coords,
+                    template_chunk_mask=template_chunk_mask,
+                    template_chunk_start=template_chunk_start,
+                    template_chunk_window_valid=template_chunk_window_valid,
+                    template_chunk_valid=template_chunk_valid,
+                    template_chunk_identity=template_chunk_identity,
+                    template_chunk_similarity=template_chunk_similarity,
                     has_template=has_template,
                 )
             )
@@ -242,14 +334,84 @@ def _thermal_sigma_angstrom(
     return sigma_m * ANGSTROM_PER_METER
 
 
+def _rebuild_template_views_from_chunks(
+    seq_len: int,
+    chunk_coords: torch.Tensor,
+    chunk_mask: torch.Tensor,
+    chunk_start: torch.Tensor,
+    chunk_window_valid: torch.Tensor,
+    chunk_valid: torch.Tensor,
+    chunk_identity: torch.Tensor,
+    chunk_similarity: torch.Tensor,
+    topk_count: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    template_coords = torch.zeros((seq_len, 3), dtype=torch.float32)
+    template_topk_coords = torch.zeros((topk_count, seq_len, 3), dtype=torch.float32)
+    template_topk_valid = torch.zeros((topk_count,), dtype=torch.bool)
+    template_topk_identity = torch.zeros((topk_count,), dtype=torch.float32)
+    template_topk_similarity = torch.zeros((topk_count,), dtype=torch.float32)
+
+    active_windows = torch.nonzero(chunk_window_valid, as_tuple=False).squeeze(-1)
+    has_template = False
+
+    coord_sum = torch.zeros((seq_len, 3), dtype=torch.float32)
+    weight_sum = torch.zeros((seq_len, 1), dtype=torch.float32)
+    first_active_window: int | None = None
+
+    for w_idx_t in active_windows:
+        w_idx = int(w_idx_t.item())
+        valid_row = chunk_valid[w_idx]
+        if not bool(valid_row.any().item()):
+            continue
+        if first_active_window is None:
+            first_active_window = w_idx
+
+        start_idx = int(chunk_start[w_idx].item())
+        win_len = int(chunk_mask[w_idx].sum().item())
+        end_idx = min(seq_len, start_idx + win_len)
+        if end_idx <= start_idx:
+            continue
+        seg_len = end_idx - start_idx
+        for k_idx in range(min(topk_count, int(valid_row.shape[0]))):
+            if not bool(valid_row[k_idx].item()):
+                continue
+            has_template = True
+            weight = max(1e-4, float(chunk_similarity[w_idx, k_idx].item()))
+            coord_sum[start_idx:end_idx] += chunk_coords[w_idx, k_idx, :seg_len] * weight
+            weight_sum[start_idx:end_idx] += weight
+
+    valid_weight = weight_sum.squeeze(-1) > 0.0
+    if bool(valid_weight.any().item()):
+        template_coords[valid_weight] = coord_sum[valid_weight] / weight_sum[valid_weight]
+
+    if first_active_window is not None:
+        w_idx = int(first_active_window)
+        start_idx = int(chunk_start[w_idx].item())
+        win_len = int(chunk_mask[w_idx].sum().item())
+        end_idx = min(seq_len, start_idx + win_len)
+        if end_idx > start_idx:
+            seg_len = end_idx - start_idx
+            k_take = min(topk_count, int(chunk_valid.shape[1]))
+            template_topk_valid[:k_take] = chunk_valid[w_idx, :k_take]
+            template_topk_identity[:k_take] = chunk_identity[w_idx, :k_take]
+            template_topk_similarity[:k_take] = chunk_similarity[w_idx, :k_take]
+            template_topk_coords[:k_take, start_idx:end_idx] = chunk_coords[w_idx, :k_take, :seg_len]
+
+    return (
+        template_coords,
+        template_topk_coords,
+        template_topk_valid,
+        template_topk_identity,
+        template_topk_similarity,
+        has_template,
+    )
+
+
 def _collate_rna_batch(
     batch: list[RNAExample],
     thermal_noise_sigma_angstrom: float = 0.0,
     add_thermal_noise: bool = False,
     use_template_only_inputs: bool = False,
-    template_chunk_length: int = 512,
-    template_chunk_stride: int = 256,
-    template_chunk_max_windows: int = 20,
 ) -> Dict[str, torch.Tensor]:
     batch_size = len(batch)
     max_len = max(item.coords.shape[0] for item in batch)
@@ -268,6 +430,22 @@ def _collate_rna_batch(
     template_topk_valid = torch.zeros(batch_size, topk_count, dtype=torch.bool)
     template_topk_identity = torch.zeros(batch_size, topk_count, dtype=torch.float32)
     template_topk_similarity = torch.zeros(batch_size, topk_count, dtype=torch.float32)
+    chunk_windows = batch[0].template_chunk_coords.shape[0] if batch else 1
+    chunk_length = batch[0].template_chunk_coords.shape[2] if batch else 1
+    template_chunk_coords = torch.zeros(
+        batch_size,
+        chunk_windows,
+        topk_count,
+        chunk_length,
+        3,
+        dtype=torch.float32,
+    )
+    template_chunk_mask = torch.zeros(batch_size, chunk_windows, chunk_length, dtype=torch.bool)
+    template_chunk_start = torch.zeros(batch_size, chunk_windows, dtype=torch.long)
+    template_chunk_window_valid = torch.zeros(batch_size, chunk_windows, dtype=torch.bool)
+    template_chunk_valid = torch.zeros(batch_size, chunk_windows, topk_count, dtype=torch.bool)
+    template_chunk_identity = torch.zeros(batch_size, chunk_windows, topk_count, dtype=torch.float32)
+    template_chunk_similarity = torch.zeros(batch_size, chunk_windows, topk_count, dtype=torch.float32)
 
     for i, item in enumerate(batch):
         seq_len = item.coords.shape[0]
@@ -279,12 +457,18 @@ def _collate_rna_batch(
         template_coords[i, :seq_len] = item.template_coords
         template_topk_coords[i, :, :seq_len] = item.template_topk_coords
         mask[i, :seq_len] = True
-        if item.has_template:
-            template_mask[i, :seq_len] = True
+        template_mask[i, :seq_len] = item.template_coords.abs().sum(dim=-1) > 0
         template_topk_valid[i] = item.template_topk_valid
         template_topk_identity[i] = item.template_topk_identity
         template_topk_similarity[i] = item.template_topk_similarity
         template_topk_mask[i, :, :seq_len] = item.template_topk_valid.unsqueeze(-1)
+        template_chunk_coords[i] = item.template_chunk_coords
+        template_chunk_mask[i] = item.template_chunk_mask
+        template_chunk_start[i] = item.template_chunk_start
+        template_chunk_window_valid[i] = item.template_chunk_window_valid
+        template_chunk_valid[i] = item.template_chunk_valid
+        template_chunk_identity[i] = item.template_chunk_identity
+        template_chunk_similarity[i] = item.template_chunk_similarity
 
     target_coords = coords.clone()
     if use_template_only_inputs:
@@ -305,53 +489,11 @@ def _collate_rna_batch(
         topk_noise = torch.randn_like(template_topk_coords) * thermal_noise_sigma_angstrom
         topk_noise = topk_noise * template_topk_mask.unsqueeze(-1).float()
         template_topk_coords = template_topk_coords + topk_noise
-
-    # Build chunked template candidates for local assembly/stitching.
-    chunk_len = max(1, int(template_chunk_length))
-    chunk_stride = max(1, int(template_chunk_stride))
-    max_windows = max(1, int(template_chunk_max_windows))
-    template_chunk_coords = torch.zeros(batch_size, max_windows, topk_count, chunk_len, 3, dtype=torch.float32)
-    template_chunk_mask = torch.zeros(batch_size, max_windows, chunk_len, dtype=torch.bool)
-    template_chunk_start = torch.zeros(batch_size, max_windows, dtype=torch.long)
-    template_chunk_window_valid = torch.zeros(batch_size, max_windows, dtype=torch.bool)
-    template_chunk_valid = torch.zeros(batch_size, max_windows, topk_count, dtype=torch.bool)
-    template_chunk_identity = torch.zeros(batch_size, max_windows, topk_count, dtype=torch.float32)
-    template_chunk_similarity = torch.zeros(batch_size, max_windows, topk_count, dtype=torch.float32)
-
-    for i in range(batch_size):
-        seq_len = int(mask[i].sum().item())
-        if seq_len <= 0:
-            continue
-
-        starts: list[int] = []
-        start = 0
-        while start < seq_len and len(starts) < max_windows:
-            starts.append(start)
-            if start + chunk_len >= seq_len:
-                break
-            start += chunk_stride
-
-        last_start = max(0, seq_len - chunk_len)
-        if last_start not in starts:
-            if len(starts) < max_windows:
-                starts.append(last_start)
-            else:
-                starts[-1] = last_start
-
-        starts = sorted(set(starts))[:max_windows]
-        for w_idx, chunk_start in enumerate(starts):
-            chunk_end = min(chunk_start + chunk_len, seq_len)
-            win_len = max(0, chunk_end - chunk_start)
-            if win_len <= 0:
-                continue
-
-            template_chunk_start[i, w_idx] = int(chunk_start)
-            template_chunk_window_valid[i, w_idx] = True
-            template_chunk_mask[i, w_idx, :win_len] = True
-            template_chunk_coords[i, w_idx, :, :win_len] = template_topk_coords[i, :, chunk_start:chunk_end]
-            template_chunk_valid[i, w_idx] = template_topk_valid[i]
-            template_chunk_identity[i, w_idx] = template_topk_identity[i]
-            template_chunk_similarity[i, w_idx] = template_topk_similarity[i]
+        chunk_noise = torch.randn_like(template_chunk_coords) * thermal_noise_sigma_angstrom
+        chunk_token_mask = template_chunk_mask.unsqueeze(2).unsqueeze(-1).float()
+        chunk_cand_mask = template_chunk_valid.unsqueeze(-1).unsqueeze(-1).float()
+        chunk_noise = chunk_noise * chunk_token_mask * chunk_cand_mask
+        template_chunk_coords = template_chunk_coords + chunk_noise
 
     return {
         "residue_idx": residue_idx,
@@ -436,32 +578,47 @@ class C147ADataModule(LightningDataModule):
             if template_path.exists() and self.hparams.precompute_templates_if_missing:
                 try:
                     payload = torch.load(template_path, map_location="cpu", weights_only=False)
-                    has_topk = (
+                    has_required_fields = (
                         isinstance(payload, dict)
-                        and "topk_templates" in payload
-                        and "topk_mask" in payload
-                        and "topk_sources" in payload
-                        and "topk_identity" in payload
-                        and "topk_similarity" in payload
+                        and "templates" in payload
+                        and "available" in payload
+                        and "chunk_topk_templates" in payload
+                        and "chunk_mask" in payload
+                        and "chunk_start" in payload
+                        and "chunk_window_valid" in payload
+                        and "chunk_topk_valid" in payload
+                        and "chunk_topk_identity" in payload
+                        and "chunk_topk_similarity" in payload
+                        and "chunk_topk_sources" in payload
                     )
                     topk_store = 0
-                    stored_policy = ""
+                    stored_chunk_policy = ""
+                    stored_alignment_mode = ""
                     stored_allow_self_fallback = True
                     stored_exclude_self = True
                     stored_max_targets: int | None = None
                     stored_max_residues = 0
+                    stored_chunk_length = 0
+                    stored_chunk_stride = 0
+                    stored_chunk_max_windows = 0
                     if isinstance(payload, dict):
                         meta = payload.get("meta", {})
                         if isinstance(meta, dict):
                             topk_store = int(meta.get("top_k_store", 0))
-                            stored_policy = str(meta.get("selection_policy", ""))
+                            stored_chunk_policy = str(meta.get("chunk_selection_policy", ""))
+                            stored_alignment_mode = str(meta.get("alignment_mode", ""))
                             stored_allow_self_fallback = bool(meta.get("allow_self_fallback", True))
                             stored_exclude_self = bool(meta.get("exclude_self", True))
                             raw_max_targets = meta.get("max_targets", None)
                             stored_max_targets = None if raw_max_targets is None else int(raw_max_targets)
                             stored_max_residues = int(meta.get("max_residues_per_target", 0))
-                    expected_policy = "topk_non_self_by_identity_similarity_no_threshold"
-                    needs_policy_upgrade = stored_policy != expected_policy
+                            stored_chunk_length = int(meta.get("chunk_length", 0))
+                            stored_chunk_stride = int(meta.get("chunk_stride", 0))
+                            stored_chunk_max_windows = int(meta.get("chunk_max_windows", 0))
+                    expected_chunk_policy = "chunked_topk_non_self_by_identity_similarity_no_threshold"
+                    expected_alignment_mode = "local"
+                    needs_chunk_policy_upgrade = stored_chunk_policy != expected_chunk_policy
+                    needs_alignment_upgrade = stored_alignment_mode != expected_alignment_mode
                     desired_max_targets = self.hparams.max_targets
                     target_coverage_insufficient = (
                         (desired_max_targets is None and stored_max_targets is not None)
@@ -472,32 +629,49 @@ class C147ADataModule(LightningDataModule):
                         )
                     )
                     residue_coverage_insufficient = stored_max_residues < int(self.hparams.max_residues_per_target)
+                    chunk_shape_mismatch = (
+                        stored_chunk_length != int(self.hparams.template_chunk_length)
+                        or stored_chunk_stride != int(self.hparams.template_chunk_stride)
+                        or stored_chunk_max_windows != int(self.hparams.template_chunk_max_windows)
+                    )
                     if (
-                        not has_topk
+                        not has_required_fields
                         or topk_store < int(self.hparams.template_topk_count)
-                        or needs_policy_upgrade
+                        or needs_chunk_policy_upgrade
+                        or needs_alignment_upgrade
                         or stored_allow_self_fallback
                         or (not stored_exclude_self)
                         or target_coverage_insufficient
                         or residue_coverage_insufficient
+                        or chunk_shape_mismatch
                     ):
                         should_precompute = True
                         log.info(
                             "Template file at %s requires template payload upgrade "
                             "(need_topk=%d, found_topk=%d, "
-                            "need_policy=%s, found_policy=%s, "
+                            "need_chunk_policy=%s, found_chunk_policy=%s, "
+                            "need_alignment=%s, found_alignment=%s, "
                             "need_max_targets=%s, found_max_targets=%s, need_max_residues=%d, found_max_residues=%d, "
+                            "need_chunk=(%d,%d,%d), found_chunk=(%d,%d,%d), "
                             "allow_self_fallback=%s, exclude_self=%s). "
                             "Recomputing.",
                             template_path,
                             int(self.hparams.template_topk_count),
                             topk_store,
-                            expected_policy,
-                            stored_policy,
+                            expected_chunk_policy,
+                            stored_chunk_policy,
+                            expected_alignment_mode,
+                            stored_alignment_mode,
                             str(desired_max_targets),
                             str(stored_max_targets),
                             int(self.hparams.max_residues_per_target),
                             stored_max_residues,
+                            int(self.hparams.template_chunk_length),
+                            int(self.hparams.template_chunk_stride),
+                            int(self.hparams.template_chunk_max_windows),
+                            stored_chunk_length,
+                            stored_chunk_stride,
+                            stored_chunk_max_windows,
                             stored_allow_self_fallback,
                             stored_exclude_self,
                         )
@@ -507,22 +681,20 @@ class C147ADataModule(LightningDataModule):
 
             if should_precompute:
                 log.info(
-                    "Precomputing template payload at %s (policy=topk_non_self_by_identity_similarity_no_threshold)...",
+                    "Precomputing chunk template payload at %s...",
                     template_path,
                 )
                 precompute_template_coords(
                     labels_path=labels_path,
                     output_path=template_path,
-                    min_percent_identity=self.hparams.template_min_percent_identity,
-                    min_similarity=self.hparams.template_min_similarity,
-                    max_templates=self.hparams.template_max_templates,
                     top_k_store=self.hparams.template_topk_count,
                     max_residues_per_target=self.hparams.max_residues_per_target,
                     max_targets=self.hparams.max_targets,
-                    length_ratio_tolerance=self.hparams.template_length_ratio_tolerance,
                     exclude_self=True,
                     enforce_min_topk=True,
-                    allow_self_fallback=False,
+                    chunk_length=self.hparams.template_chunk_length,
+                    chunk_stride=self.hparams.template_chunk_stride,
+                    chunk_max_windows=self.hparams.template_chunk_max_windows,
                     num_threads=self.hparams.template_precompute_num_threads,
                 )
 
@@ -535,50 +707,46 @@ class C147ADataModule(LightningDataModule):
         dict[str, torch.Tensor],
         dict[str, torch.Tensor],
         dict[str, torch.Tensor],
-        dict[str, list[str]],
+        dict[str, torch.Tensor],
+        dict[str, torch.Tensor],
+        dict[str, torch.Tensor],
+        dict[str, list[list[str]]],
     ]:
         if not self.hparams.use_template_coords:
-            return {}, {}, {}, {}, {}, {}, {}
+            return {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
 
         template_path = Path(self.hparams.data_dir) / self.hparams.template_file
         if not template_path.exists():
             log.warning("Template file not found at %s. Continuing without template coordinates.", template_path)
-            return {}, {}, {}, {}, {}, {}, {}
+            return {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
 
         payload = torch.load(template_path, map_location="cpu", weights_only=False)
         if isinstance(payload, dict) and "templates" in payload:
             templates = payload.get("templates", {})
             available = payload.get("available", {})
-            topk_templates = payload.get("topk_templates", {})
-            topk_mask = payload.get("topk_mask", {})
-            topk_sources = payload.get("topk_sources", {})
-            topk_identity = payload.get("topk_identity", {})
-            topk_similarity = payload.get("topk_similarity", {})
-            return templates, available, topk_templates, topk_mask, topk_identity, topk_similarity, topk_sources
+            chunk_topk_templates = payload.get("chunk_topk_templates", {})
+            chunk_mask = payload.get("chunk_mask", {})
+            chunk_start = payload.get("chunk_start", {})
+            chunk_window_valid = payload.get("chunk_window_valid", {})
+            chunk_topk_valid = payload.get("chunk_topk_valid", {})
+            chunk_topk_identity = payload.get("chunk_topk_identity", {})
+            chunk_topk_similarity = payload.get("chunk_topk_similarity", {})
+            chunk_topk_sources = payload.get("chunk_topk_sources", {})
+            return (
+                templates,
+                available,
+                chunk_topk_templates,
+                chunk_mask,
+                chunk_start,
+                chunk_window_valid,
+                chunk_topk_valid,
+                chunk_topk_identity,
+                chunk_topk_similarity,
+                chunk_topk_sources,
+            )
 
         log.warning("Template file at %s has unexpected format. Continuing without templates.", template_path)
-        return {}, {}, {}, {}, {}, {}, {}
-
-    def _estimate_chunk_windows(self, seq_len: int) -> int:
-        chunk_len = max(1, int(self.hparams.template_chunk_length))
-        chunk_stride = max(1, int(self.hparams.template_chunk_stride))
-        max_windows = max(1, int(self.hparams.template_chunk_max_windows))
-        if seq_len <= 0:
-            return 0
-        starts: list[int] = []
-        start = 0
-        while start < seq_len and len(starts) < max_windows:
-            starts.append(start)
-            if start + chunk_len >= seq_len:
-                break
-            start += chunk_stride
-        last_start = max(0, seq_len - chunk_len)
-        if last_start not in starts:
-            if len(starts) < max_windows:
-                starts.append(last_start)
-            elif starts:
-                starts[-1] = last_start
-        return len(sorted(set(starts)))
+        return {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
 
     def _validate_split_template_coverage(self, split: Dataset, split_name: str) -> None:
         if not self.hparams.use_template_coords:
@@ -597,24 +765,32 @@ class C147ADataModule(LightningDataModule):
             return
 
         min_count = required
-        failing: list[tuple[str, int, int, float]] = []
+        failing: list[tuple[str, int, int, int]] = []
         for idx in indices:
             example: RNAExample = base[idx]  # type: ignore[assignment]
-            qualified = example.template_topk_valid
-            count = int(qualified.sum().item())
-            min_count = min(min_count, count)
-            if count < required:
-                est_windows = self._estimate_chunk_windows(int(example.coords.shape[0]))
-                max_id = float(example.template_topk_identity.max().item()) if example.template_topk_identity.numel() else 0.0
-                failing.append((example.target_id, count, est_windows, max_id))
+            active_windows = torch.nonzero(example.template_chunk_window_valid, as_tuple=False).squeeze(-1)
+            if int(active_windows.numel()) <= 0:
+                failing.append((example.target_id, 0, 0, 0))
                 if len(failing) >= 10:
                     break
+                continue
+            for w_idx in active_windows.tolist():
+                count = int(example.template_chunk_valid[w_idx].sum().item())
+                min_count = min(min_count, count)
+                if count < required:
+                    failing.append((example.target_id, int(w_idx), count, int(active_windows.numel())))
+                    if len(failing) >= 10:
+                        break
+            if len(failing) >= 10:
+                break
 
         if failing:
-            details = "; ".join([f"{tid}(valid={cnt},windows={win},max_id={mx:.1f})" for tid, cnt, win, mx in failing])
+            details = "; ".join(
+                [f"{tid}(window={w_idx},valid={cnt},total_windows={total_w})" for tid, w_idx, cnt, total_w in failing]
+            )
             raise RuntimeError(
                 f"Template coverage check failed for split='{split_name}'. "
-                f"Need >= {required} non-self templates per 512-chunk sequence. "
+                f"Need >= {required} non-self templates per active 512/256 chunk window. "
                 f"Examples: {details}"
             )
 
@@ -652,7 +828,9 @@ class C147ADataModule(LightningDataModule):
         if train_val or train_test or val_test:
             raise RuntimeError(
                 "Split leakage detected: overlapping targets across splits. "
-                f"train∩val={train_val[:5]}, train∩test={train_test[:5]}, val∩test={val_test[:5]}"
+                f"train_intersect_val={train_val[:5]}, "
+                f"train_intersect_test={train_test[:5]}, "
+                f"val_intersect_test={val_test[:5]}"
             )
 
         log.info(
@@ -667,14 +845,14 @@ class C147ADataModule(LightningDataModule):
         self,
         split: Dataset,
         split_name: str,
-        topk_sources_by_target: dict[str, list[str]],
+        chunk_sources_by_target: dict[str, list[list[str]]],
         allowed_source_ids: set[str],
     ) -> None:
         if not self.hparams.use_template_coords:
             return
-        if not topk_sources_by_target:
+        if not chunk_sources_by_target:
             raise RuntimeError(
-                "Template payload is missing `topk_sources`; cannot enforce split leakage guards for templates."
+                "Template payload is missing `chunk_topk_sources`; cannot enforce split leakage guards for templates."
             )
 
         required = max(1, int(self.hparams.template_topk_count))
@@ -684,67 +862,87 @@ class C147ADataModule(LightningDataModule):
 
         for idx in indices:
             example: RNAExample = base[idx]  # type: ignore[assignment]
-            source_ids = list(topk_sources_by_target.get(example.target_id, []))
-            k_count = int(example.template_topk_valid.shape[0])
-            if len(source_ids) < k_count:
-                source_ids.extend([""] * (k_count - len(source_ids)))
+            w_count = int(example.template_chunk_valid.shape[0])
+            k_count = int(example.template_chunk_valid.shape[1])
+            source_windows = [list(row) for row in chunk_sources_by_target.get(example.target_id, [])]
+            if len(source_windows) < w_count:
+                source_windows.extend([[""] * k_count for _ in range(w_count - len(source_windows))])
 
-            for k_idx in range(k_count):
-                source_id = source_ids[k_idx]
-                keep = bool(example.template_topk_valid[k_idx].item())
-                keep = keep and source_id != "" and source_id in allowed_source_ids and source_id != example.target_id
-                if not keep:
-                    if bool(example.template_topk_valid[k_idx].item()):
-                        pruned_count += 1
-                        if source_id == example.target_id:
-                            pruned_self_count += 1
-                    example.template_topk_valid[k_idx] = False
-                    example.template_topk_identity[k_idx] = 0.0
-                    example.template_topk_similarity[k_idx] = 0.0
-                    example.template_topk_coords[k_idx].zero_()
-                    source_ids[k_idx] = ""
+            for w_idx in range(w_count):
+                if not bool(example.template_chunk_window_valid[w_idx].item()):
+                    continue
+                row_sources = source_windows[w_idx] if w_idx < len(source_windows) else []
+                if len(row_sources) < k_count:
+                    row_sources.extend([""] * (k_count - len(row_sources)))
 
-            qualified = example.template_topk_valid.clone()
-            qualified_count = int(qualified.sum().item())
-
-            # Repeat best remaining template candidate if needed; never backfill from target coordinates.
-            if 0 < qualified_count < required:
-                qualified_idx = torch.nonzero(qualified, as_tuple=False).squeeze(-1)
-                best_local = int(torch.argmax(example.template_topk_identity[qualified_idx]).item())
-                best_idx = int(qualified_idx[best_local].item())
-                fill_coords = example.template_topk_coords[best_idx].clone()
-                fill_identity = float(example.template_topk_identity[best_idx].item())
-                fill_similarity = float(example.template_topk_similarity[best_idx].item())
-                fill_source = source_ids[best_idx] if best_idx < len(source_ids) else ""
                 for k_idx in range(k_count):
-                    if qualified_count >= required:
-                        break
-                    if bool(qualified[k_idx].item()):
-                        continue
-                    example.template_topk_coords[k_idx] = fill_coords
-                    example.template_topk_valid[k_idx] = True
-                    example.template_topk_identity[k_idx] = fill_identity
-                    example.template_topk_similarity[k_idx] = fill_similarity
-                    source_ids[k_idx] = fill_source
-                    qualified[k_idx] = True
-                    qualified_count += 1
+                    source_id = row_sources[k_idx]
+                    keep = bool(example.template_chunk_valid[w_idx, k_idx].item())
+                    keep = keep and source_id != "" and source_id in allowed_source_ids and source_id != example.target_id
+                    if not keep:
+                        if bool(example.template_chunk_valid[w_idx, k_idx].item()):
+                            pruned_count += 1
+                            if source_id == example.target_id:
+                                pruned_self_count += 1
+                        example.template_chunk_valid[w_idx, k_idx] = False
+                        example.template_chunk_identity[w_idx, k_idx] = 0.0
+                        example.template_chunk_similarity[w_idx, k_idx] = 0.0
+                        example.template_chunk_coords[w_idx, k_idx].zero_()
+                        row_sources[k_idx] = ""
 
-            qualified = example.template_topk_valid.clone()
-            if bool(qualified.any().item()):
-                weights = torch.clamp(example.template_topk_similarity[qualified].to(dtype=torch.float32), min=0.0)
-                if float(weights.sum().item()) <= 0.0:
-                    weights = torch.ones_like(weights)
-                weights = weights / weights.sum()
-                coords_valid = example.template_topk_coords[qualified].to(dtype=torch.float32)
-                example.template_coords = (weights[:, None, None] * coords_valid).sum(dim=0)
-                example.has_template = True
-            else:
-                example.template_coords.zero_()
-                example.has_template = False
-            topk_sources_by_target[example.target_id] = source_ids
+                qualified = example.template_chunk_valid[w_idx].clone()
+                qualified_count = int(qualified.sum().item())
+                if 0 < qualified_count < required:
+                    qualified_idx = torch.nonzero(qualified, as_tuple=False).squeeze(-1)
+                    best_local = int(torch.argmax(example.template_chunk_identity[w_idx, qualified_idx]).item())
+                    best_idx = int(qualified_idx[best_local].item())
+                    fill_coords = example.template_chunk_coords[w_idx, best_idx].clone()
+                    fill_identity = float(example.template_chunk_identity[w_idx, best_idx].item())
+                    fill_similarity = float(example.template_chunk_similarity[w_idx, best_idx].item())
+                    fill_source = row_sources[best_idx] if best_idx < len(row_sources) else ""
+                    for k_idx in range(k_count):
+                        if qualified_count >= required:
+                            break
+                        if bool(qualified[k_idx].item()):
+                            continue
+                        example.template_chunk_coords[w_idx, k_idx] = fill_coords
+                        example.template_chunk_valid[w_idx, k_idx] = True
+                        example.template_chunk_identity[w_idx, k_idx] = fill_identity
+                        example.template_chunk_similarity[w_idx, k_idx] = fill_similarity
+                        row_sources[k_idx] = fill_source
+                        qualified[k_idx] = True
+                        qualified_count += 1
+
+                source_windows[w_idx] = row_sources[:k_count]
+
+            (
+                rebuilt_template_coords,
+                rebuilt_topk_coords,
+                rebuilt_topk_valid,
+                rebuilt_topk_identity,
+                rebuilt_topk_similarity,
+                rebuilt_has_template,
+            ) = _rebuild_template_views_from_chunks(
+                seq_len=int(example.coords.shape[0]),
+                chunk_coords=example.template_chunk_coords,
+                chunk_mask=example.template_chunk_mask,
+                chunk_start=example.template_chunk_start,
+                chunk_window_valid=example.template_chunk_window_valid,
+                chunk_valid=example.template_chunk_valid,
+                chunk_identity=example.template_chunk_identity,
+                chunk_similarity=example.template_chunk_similarity,
+                topk_count=int(example.template_topk_valid.shape[0]),
+            )
+            example.template_coords = rebuilt_template_coords
+            example.template_topk_coords = rebuilt_topk_coords
+            example.template_topk_valid = rebuilt_topk_valid
+            example.template_topk_identity = rebuilt_topk_identity
+            example.template_topk_similarity = rebuilt_topk_similarity
+            example.has_template = rebuilt_has_template
+            chunk_sources_by_target[example.target_id] = source_windows[:w_count]
 
         log.info(
-            "Template source restriction applied for split='%s': pruned %d candidate templates (self-source pruned=%d).",
+            "Chunk template source restriction applied for split='%s': pruned %d candidate templates (self-source pruned=%d).",
             split_name,
             pruned_count,
             pruned_self_count,
@@ -754,7 +952,7 @@ class C147ADataModule(LightningDataModule):
         self,
         split: Dataset,
         split_name: str,
-        topk_sources_by_target: dict[str, list[str]],
+        chunk_sources_by_target: dict[str, list[list[str]]],
     ) -> None:
         if not self.hparams.use_template_coords:
             return
@@ -763,16 +961,23 @@ class C147ADataModule(LightningDataModule):
         violations: list[tuple[str, int]] = []
         for idx in indices:
             example: RNAExample = base[idx]  # type: ignore[assignment]
-            source_ids = topk_sources_by_target.get(example.target_id, [])
-            k_count = int(example.template_topk_valid.shape[0])
-            for k_idx in range(k_count):
-                if not bool(example.template_topk_valid[k_idx].item()):
+            source_windows = chunk_sources_by_target.get(example.target_id, [])
+            w_count = int(example.template_chunk_valid.shape[0])
+            k_count = int(example.template_chunk_valid.shape[1])
+            for w_idx in range(w_count):
+                if not bool(example.template_chunk_window_valid[w_idx].item()):
                     continue
-                source_id = source_ids[k_idx] if k_idx < len(source_ids) else ""
-                if source_id == example.target_id:
-                    violations.append((example.target_id, k_idx))
-                    if len(violations) >= 10:
-                        break
+                row_sources = source_windows[w_idx] if w_idx < len(source_windows) else []
+                for k_idx in range(k_count):
+                    if not bool(example.template_chunk_valid[w_idx, k_idx].item()):
+                        continue
+                    source_id = row_sources[k_idx] if k_idx < len(row_sources) else ""
+                    if source_id == example.target_id:
+                        violations.append((example.target_id, k_idx))
+                        if len(violations) >= 10:
+                            break
+                if len(violations) >= 10:
+                    break
             if len(violations) >= 10:
                 break
 
@@ -780,10 +985,10 @@ class C147ADataModule(LightningDataModule):
             details = ", ".join([f"{tid}[k={k_idx}]" for tid, k_idx in violations])
             raise RuntimeError(
                 f"Self-source template leakage detected in split='{split_name}'. "
-                f"Found template source == target_id in active candidates: {details}"
+                f"Found chunk template source == target_id in active candidates: {details}"
             )
 
-        log.info("No self-source template candidates detected for split='%s'.", split_name)
+        log.info("No self-source chunk template candidates detected for split='%s'.", split_name)
 
     def _filter_split_min_templates(self, split: Dataset, split_name: str, min_required: int = 1) -> Dataset:
         if not self.hparams.use_template_coords:
@@ -796,8 +1001,16 @@ class C147ADataModule(LightningDataModule):
 
         for idx in indices:
             example: RNAExample = base[idx]  # type: ignore[assignment]
-            qualified = example.template_topk_valid
-            if int(qualified.sum().item()) >= required:
+            active_windows = torch.nonzero(example.template_chunk_window_valid, as_tuple=False).squeeze(-1)
+            if int(active_windows.numel()) <= 0:
+                dropped += 1
+                continue
+            has_all = True
+            for w_idx in active_windows.tolist():
+                if int(example.template_chunk_valid[w_idx].sum().item()) < required:
+                    has_all = False
+                    break
+            if has_all:
                 kept_indices.append(idx)
             else:
                 dropped += 1
@@ -827,11 +1040,14 @@ class C147ADataModule(LightningDataModule):
             (
                 template_coords_by_target,
                 template_available_by_target,
-                template_topk_coords_by_target,
-                template_topk_valid_by_target,
-                template_topk_identity_by_target,
-                template_topk_similarity_by_target,
-                template_topk_sources_by_target,
+                template_chunk_coords_by_target,
+                template_chunk_mask_by_target,
+                template_chunk_start_by_target,
+                template_chunk_window_valid_by_target,
+                template_chunk_valid_by_target,
+                template_chunk_identity_by_target,
+                template_chunk_similarity_by_target,
+                template_chunk_sources_by_target,
             ) = self._load_template_payload()
             dataset = RNAIdentityDataset(
                 labels_path=labels_path,
@@ -839,11 +1055,16 @@ class C147ADataModule(LightningDataModule):
                 max_targets=self.hparams.max_targets,
                 template_coords_by_target=template_coords_by_target,
                 template_available_by_target=template_available_by_target,
-                template_topk_coords_by_target=template_topk_coords_by_target,
-                template_topk_valid_by_target=template_topk_valid_by_target,
-                template_topk_identity_by_target=template_topk_identity_by_target,
-                template_topk_similarity_by_target=template_topk_similarity_by_target,
+                template_chunk_coords_by_target=template_chunk_coords_by_target,
+                template_chunk_mask_by_target=template_chunk_mask_by_target,
+                template_chunk_start_by_target=template_chunk_start_by_target,
+                template_chunk_window_valid_by_target=template_chunk_window_valid_by_target,
+                template_chunk_valid_by_target=template_chunk_valid_by_target,
+                template_chunk_identity_by_target=template_chunk_identity_by_target,
+                template_chunk_similarity_by_target=template_chunk_similarity_by_target,
                 template_topk_count=self.hparams.template_topk_count,
+                template_chunk_length=self.hparams.template_chunk_length,
+                template_chunk_max_windows=self.hparams.template_chunk_max_windows,
                 template_min_percent_identity=self.hparams.template_min_percent_identity,
             )
             self.num_chain_types = dataset.num_chain_types
@@ -867,24 +1088,24 @@ class C147ADataModule(LightningDataModule):
             self._restrict_split_template_sources(
                 self.data_train,
                 "train",
-                topk_sources_by_target=template_topk_sources_by_target,
+                chunk_sources_by_target=template_chunk_sources_by_target,
                 allowed_source_ids=train_ids,
             )
             self._validate_no_self_template_sources(
                 self.data_train,
                 "train",
-                topk_sources_by_target=template_topk_sources_by_target,
+                chunk_sources_by_target=template_chunk_sources_by_target,
             )
             self._restrict_split_template_sources(
                 self.data_val,
                 "val",
-                topk_sources_by_target=template_topk_sources_by_target,
+                chunk_sources_by_target=template_chunk_sources_by_target,
                 allowed_source_ids=all_ids,
             )
             self._restrict_split_template_sources(
                 self.data_test,
                 "test",
-                topk_sources_by_target=template_topk_sources_by_target,
+                chunk_sources_by_target=template_chunk_sources_by_target,
                 allowed_source_ids=all_ids,
             )
             self.data_train = self._filter_split_min_templates(
@@ -920,9 +1141,6 @@ class C147ADataModule(LightningDataModule):
                 thermal_noise_sigma_angstrom=self.thermal_noise_sigma_angstrom,
                 add_thermal_noise=self.hparams.apply_thermal_noise_train,
                 use_template_only_inputs=self.hparams.train_use_template_only_inputs,
-                template_chunk_length=self.hparams.template_chunk_length,
-                template_chunk_stride=self.hparams.template_chunk_stride,
-                template_chunk_max_windows=self.hparams.template_chunk_max_windows,
             ),
         )
 
@@ -939,9 +1157,6 @@ class C147ADataModule(LightningDataModule):
                 thermal_noise_sigma_angstrom=self.thermal_noise_sigma_angstrom,
                 add_thermal_noise=self.hparams.apply_thermal_noise_eval,
                 use_template_only_inputs=self.hparams.eval_use_template_only_inputs,
-                template_chunk_length=self.hparams.template_chunk_length,
-                template_chunk_stride=self.hparams.template_chunk_stride,
-                template_chunk_max_windows=self.hparams.template_chunk_max_windows,
             ),
         )
 
@@ -958,9 +1173,6 @@ class C147ADataModule(LightningDataModule):
                 thermal_noise_sigma_angstrom=self.thermal_noise_sigma_angstrom,
                 add_thermal_noise=self.hparams.apply_thermal_noise_eval,
                 use_template_only_inputs=self.hparams.eval_use_template_only_inputs,
-                template_chunk_length=self.hparams.template_chunk_length,
-                template_chunk_stride=self.hparams.template_chunk_stride,
-                template_chunk_max_windows=self.hparams.template_chunk_max_windows,
             ),
         )
 

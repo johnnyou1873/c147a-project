@@ -56,6 +56,14 @@ def _write_template_payload(path: Path, identity_pair: tuple[float, float] = (90
     topk_sources: dict[str, list[str]] = {}
     topk_identity: dict[str, torch.Tensor] = {}
     topk_similarity: dict[str, torch.Tensor] = {}
+    chunk_topk_templates: dict[str, torch.Tensor] = {}
+    chunk_mask: dict[str, torch.Tensor] = {}
+    chunk_start: dict[str, torch.Tensor] = {}
+    chunk_window_valid: dict[str, torch.Tensor] = {}
+    chunk_topk_valid: dict[str, torch.Tensor] = {}
+    chunk_topk_identity: dict[str, torch.Tensor] = {}
+    chunk_topk_similarity: dict[str, torch.Tensor] = {}
+    chunk_topk_sources: dict[str, list[list[str]]] = {}
 
     for target_idx in range(4):
         tid = f"T{target_idx}"
@@ -74,6 +82,16 @@ def _write_template_payload(path: Path, identity_pair: tuple[float, float] = (90
         topk_sources[tid] = [src_a, src_b]
         topk_identity[tid] = torch.tensor([float(identity_pair[0]), float(identity_pair[1])], dtype=torch.float32)
         topk_similarity[tid] = torch.tensor([0.9, 0.8], dtype=torch.float32)
+        chunk_topk_templates[tid] = topk.unsqueeze(0)  # (W=1,K=2,L=3,3)
+        chunk_mask[tid] = torch.tensor([[True, True, True]], dtype=torch.bool)
+        chunk_start[tid] = torch.tensor([0], dtype=torch.long)
+        chunk_window_valid[tid] = torch.tensor([True], dtype=torch.bool)
+        chunk_topk_valid[tid] = torch.tensor([[True, True]], dtype=torch.bool)
+        chunk_topk_identity[tid] = torch.tensor(
+            [[float(identity_pair[0]), float(identity_pair[1])]], dtype=torch.float32
+        )
+        chunk_topk_similarity[tid] = torch.tensor([[0.9, 0.8]], dtype=torch.float32)
+        chunk_topk_sources[tid] = [[src_a, src_b]]
 
     payload = {
         "templates": templates,
@@ -84,19 +102,26 @@ def _write_template_payload(path: Path, identity_pair: tuple[float, float] = (90
         "topk_sources": topk_sources,
         "topk_identity": topk_identity,
         "topk_similarity": topk_similarity,
+        "chunk_topk_templates": chunk_topk_templates,
+        "chunk_mask": chunk_mask,
+        "chunk_start": chunk_start,
+        "chunk_window_valid": chunk_window_valid,
+        "chunk_topk_valid": chunk_topk_valid,
+        "chunk_topk_identity": chunk_topk_identity,
+        "chunk_topk_similarity": chunk_topk_similarity,
+        "chunk_topk_sources": chunk_topk_sources,
         "meta": {
             "labels_path": "synthetic",
-            "min_percent_identity": 50.0,
-            "min_similarity": 0.1,
-            "selection_policy": "topk_non_self_by_identity_similarity_no_threshold",
-            "max_templates": 2,
+            "chunk_selection_policy": "chunked_topk_non_self_by_identity_similarity_no_threshold",
             "top_k_store": 2,
             "max_residues_per_target": 64,
             "max_targets": None,
-            "length_ratio_tolerance": 0.3,
             "exclude_self": True,
-            "enforce_min_topk": False,
+            "enforce_min_topk": True,
             "allow_self_fallback": False,
+            "chunk_length": 512,
+            "chunk_stride": 256,
+            "chunk_max_windows": 20,
             "num_targets": 4,
             "num_threads": 1,
             "num_targets_with_self_fallback": 0,
