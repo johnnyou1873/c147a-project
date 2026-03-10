@@ -17,7 +17,7 @@ wandb==0.25.0
 # aim>=3.16.2  # no lower than 3.16.2, see https://github.com/aimhubio/aim/issues/2550
 
 # --------- others --------- #
-# keep NumPy <2 for broad package compatibility in this stack
+# keep NumPy <3 for broad package compatibility in this stack
 numpy<2
 pandas
 biopython
