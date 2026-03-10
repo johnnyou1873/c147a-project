@@ -4,7 +4,8 @@ import argparse
 import csv
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,14 @@ log = logging.getLogger(__name__)
 
 RNA_RESIDUES = {"A", "C", "G", "U", "T"}
 RESNAME_TO_BASE = {"A": "A", "C": "C", "G": "G", "U": "U", "T": "U"}
+
+
+def _format_hms(seconds: float) -> str:
+    total = max(0, int(seconds))
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 def _make_aligner() -> PairwiseAligner:
@@ -175,6 +184,223 @@ def _adapt_template_to_query(
     return np.nan_to_num(out, nan=0.0).astype(np.float32)
 
 
+_WORKER_ALIGNER: PairwiseAligner | None = None
+_WORKER_SEQUENCES: dict[str, str] | None = None
+_WORKER_COORDS_BY_TARGET: dict[str, np.ndarray] | None = None
+_WORKER_EXACT_IDX: dict[str, list[str]] | None = None
+_WORKER_VALID_TARGET_IDS: list[str] | None = None
+_WORKER_MIN_PERCENT_IDENTITY = 50.0
+_WORKER_MIN_SIMILARITY = 0.1
+_WORKER_MAX_TEMPLATES = 8
+_WORKER_TOP_K_STORE = 5
+_WORKER_LENGTH_RATIO_TOL = 0.3
+_WORKER_EXCLUDE_SELF = True
+_WORKER_ENFORCE_MIN_TOPK = True
+_WORKER_ALLOW_SELF_FALLBACK = True
+
+
+def _init_precompute_worker(
+    sequences: dict[str, str],
+    coords_by_target: dict[str, np.ndarray],
+    exact_idx: dict[str, list[str]],
+    valid_target_ids: list[str],
+    min_percent_identity: float,
+    min_similarity: float,
+    max_templates: int,
+    top_k_store: int,
+    length_ratio_tolerance: float,
+    exclude_self: bool,
+    enforce_min_topk: bool,
+    allow_self_fallback: bool,
+) -> None:
+    global _WORKER_ALIGNER
+    global _WORKER_SEQUENCES
+    global _WORKER_COORDS_BY_TARGET
+    global _WORKER_EXACT_IDX
+    global _WORKER_VALID_TARGET_IDS
+    global _WORKER_MIN_PERCENT_IDENTITY
+    global _WORKER_MIN_SIMILARITY
+    global _WORKER_MAX_TEMPLATES
+    global _WORKER_TOP_K_STORE
+    global _WORKER_LENGTH_RATIO_TOL
+    global _WORKER_EXCLUDE_SELF
+    global _WORKER_ENFORCE_MIN_TOPK
+    global _WORKER_ALLOW_SELF_FALLBACK
+
+    _WORKER_ALIGNER = _make_aligner()
+    _WORKER_SEQUENCES = sequences
+    _WORKER_COORDS_BY_TARGET = coords_by_target
+    _WORKER_EXACT_IDX = exact_idx
+    _WORKER_VALID_TARGET_IDS = valid_target_ids
+    _WORKER_MIN_PERCENT_IDENTITY = float(min_percent_identity)
+    _WORKER_MIN_SIMILARITY = float(min_similarity)
+    _WORKER_MAX_TEMPLATES = int(max_templates)
+    _WORKER_TOP_K_STORE = int(top_k_store)
+    _WORKER_LENGTH_RATIO_TOL = float(length_ratio_tolerance)
+    _WORKER_EXCLUDE_SELF = bool(exclude_self)
+    _WORKER_ENFORCE_MIN_TOPK = bool(enforce_min_topk)
+    _WORKER_ALLOW_SELF_FALLBACK = bool(allow_self_fallback)
+
+
+def _compute_single_query_worker(
+    query_tid: str,
+) -> tuple[
+    str,
+    np.ndarray,
+    bool,
+    list[str],
+    np.ndarray,
+    np.ndarray,
+    list[str],
+    np.ndarray,
+    np.ndarray,
+    int,
+    int,
+    str,
+]:
+    if _WORKER_ALIGNER is None or _WORKER_SEQUENCES is None or _WORKER_COORDS_BY_TARGET is None:
+        raise RuntimeError("Precompute worker was not initialized.")
+    if _WORKER_EXACT_IDX is None or _WORKER_VALID_TARGET_IDS is None:
+        raise RuntimeError("Precompute worker indices were not initialized.")
+
+    aligner_local = _WORKER_ALIGNER
+    sequences = _WORKER_SEQUENCES
+    coords_by_target = _WORKER_COORDS_BY_TARGET
+    exact_idx = _WORKER_EXACT_IDX
+    valid_target_ids = _WORKER_VALID_TARGET_IDS
+
+    query_seq = sequences[query_tid]
+    q_len = len(query_seq)
+    candidates: list[tuple[str, float, float, Any]] = []
+    used_self_fallback = 0
+    used_repeated_fill = 0
+
+    for tid in exact_idx.get(query_seq, []):
+        if _WORKER_EXCLUDE_SELF and tid == query_tid:
+            continue
+        aln = aligner_local.align(query_seq, sequences[tid])[0]
+        candidates.append((tid, 1.0, 100.0, aln))
+
+    for template_tid in valid_target_ids:
+        if template_tid == query_tid and _WORKER_EXCLUDE_SELF:
+            continue
+        template_seq = sequences[template_tid]
+        if template_seq == query_seq:
+            continue
+
+        len_ratio = abs(len(template_seq) - q_len) / float(max(len(template_seq), q_len, 1))
+        if len_ratio > _WORKER_LENGTH_RATIO_TOL:
+            continue
+
+        aln = aligner_local.align(query_seq, template_seq)[0]
+        norm_similarity = float(aln.score) / float(2.0 * min(q_len, len(template_seq), 1))
+        pct_identity = _compute_identity_percent(query_seq, template_seq, aln)
+        candidates.append((template_tid, norm_similarity, pct_identity, aln))
+
+    dedup: dict[str, tuple[str, float, float, Any]] = {}
+    for item in sorted(candidates, key=lambda x: (x[2], x[1]), reverse=True):
+        if item[0] not in dedup:
+            dedup[item[0]] = item
+    selected = list(dedup.values())[: int(_WORKER_TOP_K_STORE)]
+
+    if _WORKER_ENFORCE_MIN_TOPK and len(selected) < _WORKER_TOP_K_STORE:
+        fallback_item: tuple[str, float, float, Any] | None = None
+        if selected:
+            fallback_item = selected[0]
+            used_repeated_fill = 1
+        elif _WORKER_ALLOW_SELF_FALLBACK:
+            self_aln = aligner_local.align(query_seq, query_seq)[0]
+            fallback_item = (query_tid, 1.0, 100.0, self_aln)
+            used_self_fallback = 1
+        if fallback_item is not None:
+            while len(selected) < _WORKER_TOP_K_STORE:
+                selected.append(fallback_item)
+
+    if not selected:
+        return (
+            query_tid,
+            np.zeros((q_len, 3), dtype=np.float32),
+            False,
+            [],
+            np.zeros((_WORKER_TOP_K_STORE, q_len, 3), dtype=np.float32),
+            np.zeros((_WORKER_TOP_K_STORE,), dtype=np.bool_),
+            [],
+            np.zeros((_WORKER_TOP_K_STORE,), dtype=np.float32),
+            np.zeros((_WORKER_TOP_K_STORE,), dtype=np.float32),
+            used_self_fallback,
+            used_repeated_fill,
+            f"pid:{os.getpid()}",
+        )
+
+    adapted_coords = []
+    weights = []
+    used_ids = []
+    used_identity = []
+    used_similarity = []
+    for template_tid, sim, pct_identity, aln in selected:
+        adapted = _adapt_template_to_query(
+            query_seq=query_seq,
+            template_seq=sequences[template_tid],
+            template_coords=coords_by_target[template_tid],
+            alignment=aln,
+        )
+        adapted_coords.append(adapted)
+        weights.append(max(0.0, sim))
+        used_ids.append(template_tid)
+        used_similarity.append(float(sim))
+        used_identity.append(float(pct_identity))
+
+    w = np.asarray(weights, dtype=np.float32)
+    if np.all(w <= 0):
+        w[:] = 1.0
+    w = np.exp(w - np.max(w))
+    w = w / np.sum(w)
+    stacked = np.stack(adapted_coords, axis=0)  # (K, L, 3)
+    consensus = np.tensordot(w, stacked, axes=(0, 0)).astype(np.float32)
+
+    topk_coords = np.zeros((_WORKER_TOP_K_STORE, q_len, 3), dtype=np.float32)
+    topk_valid = np.zeros((_WORKER_TOP_K_STORE,), dtype=np.bool_)
+    topk_id = np.zeros((_WORKER_TOP_K_STORE,), dtype=np.float32)
+    topk_sim = np.zeros((_WORKER_TOP_K_STORE,), dtype=np.float32)
+    topk_ids_used: list[str] = []
+    for k_idx, (coords_k, tid_k, id_k, sim_k) in enumerate(
+        zip(
+            adapted_coords[: _WORKER_TOP_K_STORE],
+            used_ids[: _WORKER_TOP_K_STORE],
+            used_identity[: _WORKER_TOP_K_STORE],
+            used_similarity[: _WORKER_TOP_K_STORE],
+        )
+    ):
+        topk_coords[k_idx] = coords_k.astype(np.float32, copy=False)
+        topk_valid[k_idx] = True
+        topk_id[k_idx] = float(id_k)
+        topk_sim[k_idx] = float(sim_k)
+        topk_ids_used.append(tid_k)
+
+    if _WORKER_ENFORCE_MIN_TOPK:
+        valid_count = int(np.sum(topk_valid))
+        if valid_count < _WORKER_TOP_K_STORE:
+            raise RuntimeError(
+                f"Template coverage guarantee failed for target '{query_tid}': "
+                f"valid={valid_count}, required_valid={_WORKER_TOP_K_STORE}"
+            )
+
+    return (
+        query_tid,
+        consensus,
+        True,
+        used_ids,
+        topk_coords,
+        topk_valid,
+        topk_ids_used,
+        topk_id,
+        topk_sim,
+        used_self_fallback,
+        used_repeated_fill,
+        f"pid:{os.getpid()}",
+    )
+
+
 def precompute_template_coords(
     labels_path: str | Path,
     output_path: str | Path,
@@ -199,7 +425,6 @@ def precompute_template_coords(
         max_residues_per_target=max_residues_per_target,
         max_targets=max_targets,
     )
-    aligner = _make_aligner()
 
     valid_target_ids = [tid for tid, c in coords_by_target.items() if _coords_are_valid(c)]
     exact_idx: dict[str, list[str]] = {}
@@ -224,171 +449,47 @@ def precompute_template_coords(
     else:
         worker_threads = max(1, requested_threads)
     worker_threads = min(worker_threads, max(1, total_targets))
+    worker_ids_seen: set[str] = set()
+    progress_start = time.perf_counter()
+    progress_every = max(1, min(250, total_targets // 100 if total_targets >= 100 else 10))
+    last_logged_done = 0
 
-    def _compute_single_query(
-        query_tid: str,
-    ) -> tuple[
-        str,
-        torch.Tensor,
-        bool,
-        list[str],
-        torch.Tensor,
-        torch.Tensor,
-        list[str],
-        torch.Tensor,
-        torch.Tensor,
-        int,
-        int,
-    ]:
-        aligner_local = _make_aligner()
-        query_seq = sequences[query_tid]
-        q_len = len(query_seq)
-        candidates: list[tuple[str, float, float, Any]] = []
-        used_self_fallback = 0
-        used_repeated_fill = 0
-
-        for tid in exact_idx.get(query_seq, []):
-            if exclude_self and tid == query_tid:
-                continue
-            aln = aligner_local.align(query_seq, sequences[tid])[0]
-            candidates.append((tid, 1.0, 100.0, aln))
-
-        for template_tid in valid_target_ids:
-            if template_tid == query_tid and exclude_self:
-                continue
-            template_seq = sequences[template_tid]
-            if template_seq == query_seq:
-                continue
-
-            len_ratio = abs(len(template_seq) - q_len) / float(max(len(template_seq), q_len, 1))
-            if len_ratio > length_ratio_tolerance:
-                continue
-
-            aln = aligner_local.align(query_seq, template_seq)[0]
-            norm_similarity = float(aln.score) / float(2.0 * min(q_len, len(template_seq), 1))
-            pct_identity = _compute_identity_percent(query_seq, template_seq, aln)
-            if norm_similarity < min_similarity or pct_identity < min_percent_identity:
-                continue
-            candidates.append((template_tid, norm_similarity, pct_identity, aln))
-
-        dedup: dict[str, tuple[str, float, float, Any]] = {}
-        # Rank primarily by percent identity, then by normalized similarity.
-        for item in sorted(candidates, key=lambda x: (x[2], x[1]), reverse=True):
-            if item[0] not in dedup:
-                dedup[item[0]] = item
-        selected = list(dedup.values())[: max(max_templates, top_k_store)]
-
-        if enforce_min_topk and len(selected) < top_k_store:
-            fallback_item: tuple[str, float, float, Any] | None = None
-            if selected:
-                fallback_item = selected[0]
-                used_repeated_fill = 1
-            elif allow_self_fallback:
-                self_aln = aligner_local.align(query_seq, query_seq)[0]
-                fallback_item = (query_tid, 1.0, 100.0, self_aln)
-                used_self_fallback = 1
-            if fallback_item is not None:
-                while len(selected) < top_k_store:
-                    selected.append(fallback_item)
-
-        if not selected:
-            return (
-                query_tid,
-                torch.zeros((q_len, 3), dtype=torch.float32),
-                False,
-                [],
-                torch.zeros((top_k_store, q_len, 3), dtype=torch.float32),
-                torch.zeros((top_k_store,), dtype=torch.bool),
-                [],
-                torch.zeros((top_k_store,), dtype=torch.float32),
-                torch.zeros((top_k_store,), dtype=torch.float32),
-                used_self_fallback,
-                used_repeated_fill,
-            )
-
-        adapted_coords = []
-        weights = []
-        used_ids = []
-        used_identity = []
-        used_similarity = []
-        for template_tid, sim, pct_identity, aln in selected:
-            adapted = _adapt_template_to_query(
-                query_seq=query_seq,
-                template_seq=sequences[template_tid],
-                template_coords=coords_by_target[template_tid],
-                alignment=aln,
-            )
-            adapted_coords.append(adapted)
-            weights.append(max(0.0, sim))
-            used_ids.append(template_tid)
-            used_similarity.append(float(sim))
-            used_identity.append(float(pct_identity))
-
-        w = np.asarray(weights, dtype=np.float32)
-        if np.all(w <= 0):
-            w[:] = 1.0
-        w = np.exp(w - np.max(w))
-        w = w / np.sum(w)
-        stacked = np.stack(adapted_coords, axis=0)  # (K, L, 3)
-        consensus = np.tensordot(w, stacked, axes=(0, 0)).astype(np.float32)
-
-        topk_coords = np.zeros((top_k_store, q_len, 3), dtype=np.float32)
-        topk_valid = np.zeros((top_k_store,), dtype=np.bool_)
-        topk_id = np.zeros((top_k_store,), dtype=np.float32)
-        topk_sim = np.zeros((top_k_store,), dtype=np.float32)
-        topk_ids_used: list[str] = []
-        for k_idx, (coords_k, tid_k, id_k, sim_k) in enumerate(
-            zip(adapted_coords[:top_k_store], used_ids[:top_k_store], used_identity[:top_k_store], used_similarity[:top_k_store])
-        ):
-            topk_coords[k_idx] = coords_k.astype(np.float32, copy=False)
-            topk_valid[k_idx] = True
-            topk_id[k_idx] = float(id_k)
-            topk_sim[k_idx] = float(sim_k)
-            topk_ids_used.append(tid_k)
-
-        topk_templates[query_tid] = torch.from_numpy(topk_coords)
-        topk_mask[query_tid] = torch.from_numpy(topk_valid)
-        topk_sources[query_tid] = topk_ids_used
-        topk_identity[query_tid] = torch.from_numpy(topk_id)
-        topk_similarity[query_tid] = torch.from_numpy(topk_sim)
-
-        if enforce_min_topk:
-            valid_count = int(np.sum(topk_valid))
-            min_id = float(np.min(topk_id[:valid_count])) if valid_count > 0 else 0.0
-            if valid_count < top_k_store or min_id < float(min_percent_identity):
-                raise RuntimeError(
-                    f"Template coverage guarantee failed for target '{query_tid}': "
-                    f"valid={valid_count}, min_identity={min_id:.2f}, "
-                    f"required_valid={top_k_store}, required_identity>={min_percent_identity:.1f}"
-                )
-
-        return (
-            query_tid,
-            torch.from_numpy(consensus),
-            True,
-            used_ids,
-            torch.from_numpy(topk_coords),
-            torch.from_numpy(topk_valid),
-            topk_ids_used,
-            torch.from_numpy(topk_id),
-            torch.from_numpy(topk_sim),
-            used_self_fallback,
-            used_repeated_fill,
+    def _log_progress(done: int, force: bool = False) -> None:
+        nonlocal last_logged_done
+        if (not force) and (done % progress_every != 0):
+            return
+        if force and done == last_logged_done:
+            return
+        elapsed = time.perf_counter() - progress_start
+        rate = done / max(elapsed, 1e-9)
+        remaining = max(0, total_targets - done)
+        eta = remaining / max(rate, 1e-9)
+        pct = 100.0 * float(done) / float(max(1, total_targets))
+        log.info(
+            "Template precompute progress: %d/%d (%.1f%%) elapsed=%s eta=%s rate=%.2f targets/s",
+            done,
+            total_targets,
+            pct,
+            _format_hms(elapsed),
+            _format_hms(eta),
+            rate,
         )
+        last_logged_done = done
 
     def _store_query_result(
         result: tuple[
             str,
-            torch.Tensor,
+            np.ndarray,
             bool,
             list[str],
-            torch.Tensor,
-            torch.Tensor,
+            np.ndarray,
+            np.ndarray,
             list[str],
-            torch.Tensor,
-            torch.Tensor,
+            np.ndarray,
+            np.ndarray,
             int,
             int,
+            str,
         ]
     ) -> None:
         nonlocal num_targets_with_self_fallback, num_targets_with_repeated_templates
@@ -404,35 +505,85 @@ def precompute_template_coords(
             topk_sim_tensor,
             self_fallback_flag,
             repeated_fill_flag,
+            worker_name,
         ) = result
-        templates[query_tid] = template_tensor
+        worker_ids_seen.add(worker_name)
+        templates[query_tid] = torch.from_numpy(template_tensor.astype(np.float32, copy=False))
         available[query_tid] = bool(is_available)
         sources[query_tid] = source_ids
-        topk_templates[query_tid] = topk_tensor
-        topk_mask[query_tid] = topk_valid_tensor
+        topk_templates[query_tid] = torch.from_numpy(topk_tensor.astype(np.float32, copy=False))
+        topk_mask[query_tid] = torch.from_numpy(topk_valid_tensor.astype(np.bool_, copy=False))
         topk_sources[query_tid] = topk_source_ids
-        topk_identity[query_tid] = topk_id_tensor
-        topk_similarity[query_tid] = topk_sim_tensor
+        topk_identity[query_tid] = torch.from_numpy(topk_id_tensor.astype(np.float32, copy=False))
+        topk_similarity[query_tid] = torch.from_numpy(topk_sim_tensor.astype(np.float32, copy=False))
         num_targets_with_self_fallback += int(self_fallback_flag)
         num_targets_with_repeated_templates += int(repeated_fill_flag)
 
     log.info(
-        "Template precompute started for %d targets using %d thread(s).",
+        "Template precompute started for %d targets using %d process(es).",
         total_targets,
         worker_threads,
     )
 
     if worker_threads > 1 and total_targets > 1:
-        with ThreadPoolExecutor(max_workers=worker_threads) as executor:
-            for idx, result in enumerate(executor.map(_compute_single_query, valid_target_ids), start=1):
-                _store_query_result(result)
-                if idx % 250 == 0 or idx == total_targets:
-                    log.info("Template precompute progress: %d/%d targets", idx, total_targets)
+        with ProcessPoolExecutor(
+            max_workers=worker_threads,
+            initializer=_init_precompute_worker,
+            initargs=(
+                sequences,
+                coords_by_target,
+                exact_idx,
+                valid_target_ids,
+                float(min_percent_identity),
+                float(min_similarity),
+                int(max_templates),
+                int(top_k_store),
+                float(length_ratio_tolerance),
+                bool(exclude_self),
+                bool(enforce_min_topk),
+                bool(allow_self_fallback),
+            ),
+        ) as executor:
+            futures = [executor.submit(_compute_single_query_worker, query_tid) for query_tid in valid_target_ids]
+            done = 0
+            for future in as_completed(futures):
+                _store_query_result(future.result())
+                done += 1
+                _log_progress(done)
+            _log_progress(done, force=True)
     else:
+        _init_precompute_worker(
+            sequences,
+            coords_by_target,
+            exact_idx,
+            valid_target_ids,
+            float(min_percent_identity),
+            float(min_similarity),
+            int(max_templates),
+            int(top_k_store),
+            float(length_ratio_tolerance),
+            bool(exclude_self),
+            bool(enforce_min_topk),
+            bool(allow_self_fallback),
+        )
         for idx, query_tid in enumerate(valid_target_ids, start=1):
-            _store_query_result(_compute_single_query(query_tid))
-            if idx % 250 == 0 or idx == total_targets:
-                log.info("Template precompute progress: %d/%d targets", idx, total_targets)
+            _store_query_result(_compute_single_query_worker(query_tid))
+            _log_progress(idx)
+        _log_progress(total_targets, force=True)
+
+    used_workers = len(worker_ids_seen)
+    log.info(
+        "Template precompute worker utilization: used %d/%d process(es).",
+        used_workers,
+        worker_threads,
+    )
+    if used_workers < worker_threads and total_targets >= worker_threads:
+        log.warning(
+            "Precompute used fewer processes than requested (used=%d, requested=%d). "
+            "This can indicate startup overhead or workload imbalance.",
+            used_workers,
+            worker_threads,
+        )
 
     payload = {
         "templates": templates,
@@ -447,6 +598,7 @@ def precompute_template_coords(
             "labels_path": str(labels.resolve()),
             "min_percent_identity": float(min_percent_identity),
             "min_similarity": float(min_similarity),
+            "selection_policy": "topk_non_self_by_identity_similarity_no_threshold",
             "max_templates": int(max_templates),
             "top_k_store": int(top_k_store),
             "max_residues_per_target": int(max_residues_per_target),
@@ -457,6 +609,7 @@ def precompute_template_coords(
             "allow_self_fallback": bool(allow_self_fallback),
             "num_targets": int(len(valid_target_ids)),
             "num_threads": int(worker_threads),
+            "executor_type": "process",
             "num_targets_with_self_fallback": int(num_targets_with_self_fallback),
             "num_targets_with_repeated_templates": int(num_targets_with_repeated_templates),
         },

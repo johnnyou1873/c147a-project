@@ -2,7 +2,7 @@ _target_: src.data.c147a_datamodule.C147ADataModule
 data_dir: ${paths.data_dir}
 labels_file: train_labels.csv
 batch_size: 4
-num_workers: 4
+num_workers: 8
 pin_memory: False
 persistent_workers: False
 train_fraction: 0.95
@@ -12,10 +12,12 @@ max_targets: null
 temperature_k: 300.0
 apply_thermal_noise_train: true
 apply_thermal_noise_eval: false
+train_use_template_only_inputs: true
+eval_use_template_only_inputs: true
 use_template_coords: true
 template_file: template_coords.pt
 precompute_templates_if_missing: true
-template_precompute_num_threads: 8
+template_precompute_num_threads: 12
 template_min_percent_identity: 50.0
 template_min_similarity: 0.1
 template_max_templates: 8

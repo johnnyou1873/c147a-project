@@ -171,28 +171,34 @@ class RNAIdentityDataset(Dataset[RNAExample]):
                         template_topk_similarity[: min(k_take, similarity_topk_t.numel())] = similarity_topk_t[:k_take]
 
             if self.enforce_template_coverage:
-                qualified = template_topk_valid & (template_topk_identity >= self.template_min_percent_identity)
+                qualified = template_topk_valid.clone()
                 qualified_count = int(qualified.sum().item())
-                if qualified_count < self.template_topk_count:
-                    fallback_coords = template_coords.clone() if has_template else coords_t.clone()
-                    if not has_template:
-                        template_coords = fallback_coords.clone()
-                        has_template = True
+                # Never backfill from query/ground-truth coordinates. If coverage is low but at least
+                # one real template exists, repeat the best available template candidate.
+                if 0 < qualified_count < self.template_topk_count:
+                    qualified_idx = torch.nonzero(qualified, as_tuple=False).squeeze(-1)
+                    best_local = int(torch.argmax(template_topk_identity[qualified_idx]).item())
+                    best_idx = int(qualified_idx[best_local].item())
+                    fill_coords = template_topk_coords[best_idx].clone()
+                    fill_identity = float(template_topk_identity[best_idx].item())
+                    fill_similarity = float(template_topk_similarity[best_idx].item())
 
                     for k_idx in range(self.template_topk_count):
                         if qualified_count >= self.template_topk_count:
                             break
                         if bool(qualified[k_idx].item()):
                             continue
-                        template_topk_coords[k_idx] = fallback_coords
+                        template_topk_coords[k_idx] = fill_coords
                         template_topk_valid[k_idx] = True
-                        template_topk_identity[k_idx] = 100.0
-                        template_topk_similarity[k_idx] = max(
-                            float(template_topk_similarity[k_idx].item()),
-                            1.0,
-                        )
+                        template_topk_identity[k_idx] = fill_identity
+                        template_topk_similarity[k_idx] = fill_similarity
                         qualified[k_idx] = True
                         qualified_count += 1
+
+            qualified = template_topk_valid.clone()
+            has_template = bool(has_template or bool(qualified.any().item()))
+            if has_template and not bool((template_coords.abs().sum() > 0).item()) and bool(qualified.any().item()):
+                template_coords = template_topk_coords[qualified][0].clone()
 
             if has_template:
                 num_examples_with_template += 1
@@ -240,6 +246,7 @@ def _collate_rna_batch(
     batch: list[RNAExample],
     thermal_noise_sigma_angstrom: float = 0.0,
     add_thermal_noise: bool = False,
+    use_template_only_inputs: bool = False,
     template_chunk_length: int = 512,
     template_chunk_stride: int = 256,
     template_chunk_max_windows: int = 20,
@@ -280,6 +287,10 @@ def _collate_rna_batch(
         template_topk_mask[i, :, :seq_len] = item.template_topk_valid.unsqueeze(-1)
 
     target_coords = coords.clone()
+    if use_template_only_inputs:
+        # Strict template-only training/eval mode: do not expose target-derived coords as model inputs.
+        coords = template_coords.clone()
+        coords = coords * template_mask.unsqueeze(-1).float()
 
     if add_thermal_noise and thermal_noise_sigma_angstrom > 0.0:
         noise = torch.randn_like(coords) * thermal_noise_sigma_angstrom
@@ -385,6 +396,8 @@ class C147ADataModule(LightningDataModule):
         temperature_k: float = 600.0,
         apply_thermal_noise_train: bool = True,
         apply_thermal_noise_eval: bool = False,
+        train_use_template_only_inputs: bool = True,
+        eval_use_template_only_inputs: bool = True,
         use_template_coords: bool = True,
         template_file: str = "template_coords.pt",
         precompute_templates_if_missing: bool = True,
@@ -427,24 +440,28 @@ class C147ADataModule(LightningDataModule):
                         isinstance(payload, dict)
                         and "topk_templates" in payload
                         and "topk_mask" in payload
+                        and "topk_sources" in payload
                         and "topk_identity" in payload
                         and "topk_similarity" in payload
                     )
                     topk_store = 0
-                    stored_min_identity = 0.0
-                    stored_enforce = False
+                    stored_policy = ""
+                    stored_allow_self_fallback = True
+                    stored_exclude_self = True
                     stored_max_targets: int | None = None
                     stored_max_residues = 0
                     if isinstance(payload, dict):
                         meta = payload.get("meta", {})
                         if isinstance(meta, dict):
                             topk_store = int(meta.get("top_k_store", 0))
-                            stored_min_identity = float(meta.get("min_percent_identity", 0.0))
-                            stored_enforce = bool(meta.get("enforce_min_topk", False))
+                            stored_policy = str(meta.get("selection_policy", ""))
+                            stored_allow_self_fallback = bool(meta.get("allow_self_fallback", True))
+                            stored_exclude_self = bool(meta.get("exclude_self", True))
                             raw_max_targets = meta.get("max_targets", None)
                             stored_max_targets = None if raw_max_targets is None else int(raw_max_targets)
                             stored_max_residues = int(meta.get("max_residues_per_target", 0))
-                    needs_identity_upgrade = stored_min_identity < float(self.hparams.template_min_percent_identity)
+                    expected_policy = "topk_non_self_by_identity_similarity_no_threshold"
+                    needs_policy_upgrade = stored_policy != expected_policy
                     desired_max_targets = self.hparams.max_targets
                     target_coverage_insufficient = (
                         (desired_max_targets is None and stored_max_targets is not None)
@@ -458,28 +475,31 @@ class C147ADataModule(LightningDataModule):
                     if (
                         not has_topk
                         or topk_store < int(self.hparams.template_topk_count)
-                        or needs_identity_upgrade
-                        or not stored_enforce
+                        or needs_policy_upgrade
+                        or stored_allow_self_fallback
+                        or (not stored_exclude_self)
                         or target_coverage_insufficient
                         or residue_coverage_insufficient
                     ):
                         should_precompute = True
                         log.info(
                             "Template file at %s requires template payload upgrade "
-                            "(need_topk=%d, found_topk=%d, need_min_identity=%.1f, found_min_identity=%.1f, "
+                            "(need_topk=%d, found_topk=%d, "
+                            "need_policy=%s, found_policy=%s, "
                             "need_max_targets=%s, found_max_targets=%s, need_max_residues=%d, found_max_residues=%d, "
-                            "enforce=%s). "
+                            "allow_self_fallback=%s, exclude_self=%s). "
                             "Recomputing.",
                             template_path,
                             int(self.hparams.template_topk_count),
                             topk_store,
-                            float(self.hparams.template_min_percent_identity),
-                            stored_min_identity,
+                            expected_policy,
+                            stored_policy,
                             str(desired_max_targets),
                             str(stored_max_targets),
                             int(self.hparams.max_residues_per_target),
                             stored_max_residues,
-                            stored_enforce,
+                            stored_allow_self_fallback,
+                            stored_exclude_self,
                         )
                 except Exception:
                     should_precompute = True
@@ -487,10 +507,8 @@ class C147ADataModule(LightningDataModule):
 
             if should_precompute:
                 log.info(
-                    "Precomputing template payload at %s (min_identity=%.1f%%, min_similarity=%.2f)...",
+                    "Precomputing template payload at %s (policy=topk_non_self_by_identity_similarity_no_threshold)...",
                     template_path,
-                    self.hparams.template_min_percent_identity,
-                    self.hparams.template_min_similarity,
                 )
                 precompute_template_coords(
                     labels_path=labels_path,
@@ -503,6 +521,8 @@ class C147ADataModule(LightningDataModule):
                     max_targets=self.hparams.max_targets,
                     length_ratio_tolerance=self.hparams.template_length_ratio_tolerance,
                     exclude_self=True,
+                    enforce_min_topk=True,
+                    allow_self_fallback=False,
                     num_threads=self.hparams.template_precompute_num_threads,
                 )
 
@@ -515,14 +535,15 @@ class C147ADataModule(LightningDataModule):
         dict[str, torch.Tensor],
         dict[str, torch.Tensor],
         dict[str, torch.Tensor],
+        dict[str, list[str]],
     ]:
         if not self.hparams.use_template_coords:
-            return {}, {}, {}, {}, {}, {}
+            return {}, {}, {}, {}, {}, {}, {}
 
         template_path = Path(self.hparams.data_dir) / self.hparams.template_file
         if not template_path.exists():
             log.warning("Template file not found at %s. Continuing without template coordinates.", template_path)
-            return {}, {}, {}, {}, {}, {}
+            return {}, {}, {}, {}, {}, {}, {}
 
         payload = torch.load(template_path, map_location="cpu", weights_only=False)
         if isinstance(payload, dict) and "templates" in payload:
@@ -530,12 +551,13 @@ class C147ADataModule(LightningDataModule):
             available = payload.get("available", {})
             topk_templates = payload.get("topk_templates", {})
             topk_mask = payload.get("topk_mask", {})
+            topk_sources = payload.get("topk_sources", {})
             topk_identity = payload.get("topk_identity", {})
             topk_similarity = payload.get("topk_similarity", {})
-            return templates, available, topk_templates, topk_mask, topk_identity, topk_similarity
+            return templates, available, topk_templates, topk_mask, topk_identity, topk_similarity, topk_sources
 
         log.warning("Template file at %s has unexpected format. Continuing without templates.", template_path)
-        return {}, {}, {}, {}, {}, {}
+        return {}, {}, {}, {}, {}, {}, {}
 
     def _estimate_chunk_windows(self, seq_len: int) -> int:
         chunk_len = max(1, int(self.hparams.template_chunk_length))
@@ -563,7 +585,6 @@ class C147ADataModule(LightningDataModule):
             return
 
         required = max(1, int(self.hparams.template_topk_count))
-        min_identity = float(self.hparams.template_min_percent_identity)
 
         if isinstance(split, Subset):
             base = split.dataset
@@ -579,7 +600,7 @@ class C147ADataModule(LightningDataModule):
         failing: list[tuple[str, int, int, float]] = []
         for idx in indices:
             example: RNAExample = base[idx]  # type: ignore[assignment]
-            qualified = example.template_topk_valid & (example.template_topk_identity >= min_identity)
+            qualified = example.template_topk_valid
             count = int(qualified.sum().item())
             min_count = min(min_count, count)
             if count < required:
@@ -593,17 +614,205 @@ class C147ADataModule(LightningDataModule):
             details = "; ".join([f"{tid}(valid={cnt},windows={win},max_id={mx:.1f})" for tid, cnt, win, mx in failing])
             raise RuntimeError(
                 f"Template coverage check failed for split='{split_name}'. "
-                f"Need >= {required} templates with identity >= {min_identity:.1f}% per 512-chunk sequence. "
+                f"Need >= {required} non-self templates per 512-chunk sequence. "
                 f"Examples: {details}"
             )
 
         log.info(
-            "Template coverage check passed for split='%s': min qualified templates=%d (required=%d, min_identity=%.1f%%).",
+            "Template coverage check passed for split='%s': min valid templates=%d (required=%d).",
             split_name,
             min_count,
             required,
-            min_identity,
         )
+
+    def _split_indices(self, split: Dataset) -> tuple[Dataset, list[int]]:
+        if isinstance(split, Subset):
+            return split.dataset, list(split.indices)
+        return split, list(range(len(split)))
+
+    def _split_target_ids(self, split: Dataset) -> set[str]:
+        base, indices = self._split_indices(split)
+        target_ids: set[str] = set()
+        for idx in indices:
+            example: RNAExample = base[idx]  # type: ignore[assignment]
+            target_ids.add(example.target_id)
+        return target_ids
+
+    def _validate_disjoint_splits(self) -> tuple[set[str], set[str], set[str]]:
+        if self.data_train is None or self.data_val is None or self.data_test is None:
+            raise RuntimeError("Datamodule splits are not initialized.")
+
+        train_ids = self._split_target_ids(self.data_train)
+        val_ids = self._split_target_ids(self.data_val)
+        test_ids = self._split_target_ids(self.data_test)
+
+        train_val = sorted(train_ids.intersection(val_ids))
+        train_test = sorted(train_ids.intersection(test_ids))
+        val_test = sorted(val_ids.intersection(test_ids))
+        if train_val or train_test or val_test:
+            raise RuntimeError(
+                "Split leakage detected: overlapping targets across splits. "
+                f"train∩val={train_val[:5]}, train∩test={train_test[:5]}, val∩test={val_test[:5]}"
+            )
+
+        log.info(
+            "Split disjointness check passed: train=%d, val=%d, test=%d targets.",
+            len(train_ids),
+            len(val_ids),
+            len(test_ids),
+        )
+        return train_ids, val_ids, test_ids
+
+    def _restrict_split_template_sources(
+        self,
+        split: Dataset,
+        split_name: str,
+        topk_sources_by_target: dict[str, list[str]],
+        allowed_source_ids: set[str],
+    ) -> None:
+        if not self.hparams.use_template_coords:
+            return
+        if not topk_sources_by_target:
+            raise RuntimeError(
+                "Template payload is missing `topk_sources`; cannot enforce split leakage guards for templates."
+            )
+
+        required = max(1, int(self.hparams.template_topk_count))
+        base, indices = self._split_indices(split)
+        pruned_count = 0
+        pruned_self_count = 0
+
+        for idx in indices:
+            example: RNAExample = base[idx]  # type: ignore[assignment]
+            source_ids = list(topk_sources_by_target.get(example.target_id, []))
+            k_count = int(example.template_topk_valid.shape[0])
+            if len(source_ids) < k_count:
+                source_ids.extend([""] * (k_count - len(source_ids)))
+
+            for k_idx in range(k_count):
+                source_id = source_ids[k_idx]
+                keep = bool(example.template_topk_valid[k_idx].item())
+                keep = keep and source_id != "" and source_id in allowed_source_ids and source_id != example.target_id
+                if not keep:
+                    if bool(example.template_topk_valid[k_idx].item()):
+                        pruned_count += 1
+                        if source_id == example.target_id:
+                            pruned_self_count += 1
+                    example.template_topk_valid[k_idx] = False
+                    example.template_topk_identity[k_idx] = 0.0
+                    example.template_topk_similarity[k_idx] = 0.0
+                    example.template_topk_coords[k_idx].zero_()
+                    source_ids[k_idx] = ""
+
+            qualified = example.template_topk_valid.clone()
+            qualified_count = int(qualified.sum().item())
+
+            # Repeat best remaining template candidate if needed; never backfill from target coordinates.
+            if 0 < qualified_count < required:
+                qualified_idx = torch.nonzero(qualified, as_tuple=False).squeeze(-1)
+                best_local = int(torch.argmax(example.template_topk_identity[qualified_idx]).item())
+                best_idx = int(qualified_idx[best_local].item())
+                fill_coords = example.template_topk_coords[best_idx].clone()
+                fill_identity = float(example.template_topk_identity[best_idx].item())
+                fill_similarity = float(example.template_topk_similarity[best_idx].item())
+                fill_source = source_ids[best_idx] if best_idx < len(source_ids) else ""
+                for k_idx in range(k_count):
+                    if qualified_count >= required:
+                        break
+                    if bool(qualified[k_idx].item()):
+                        continue
+                    example.template_topk_coords[k_idx] = fill_coords
+                    example.template_topk_valid[k_idx] = True
+                    example.template_topk_identity[k_idx] = fill_identity
+                    example.template_topk_similarity[k_idx] = fill_similarity
+                    source_ids[k_idx] = fill_source
+                    qualified[k_idx] = True
+                    qualified_count += 1
+
+            qualified = example.template_topk_valid.clone()
+            if bool(qualified.any().item()):
+                weights = torch.clamp(example.template_topk_similarity[qualified].to(dtype=torch.float32), min=0.0)
+                if float(weights.sum().item()) <= 0.0:
+                    weights = torch.ones_like(weights)
+                weights = weights / weights.sum()
+                coords_valid = example.template_topk_coords[qualified].to(dtype=torch.float32)
+                example.template_coords = (weights[:, None, None] * coords_valid).sum(dim=0)
+                example.has_template = True
+            else:
+                example.template_coords.zero_()
+                example.has_template = False
+            topk_sources_by_target[example.target_id] = source_ids
+
+        log.info(
+            "Template source restriction applied for split='%s': pruned %d candidate templates (self-source pruned=%d).",
+            split_name,
+            pruned_count,
+            pruned_self_count,
+        )
+
+    def _validate_no_self_template_sources(
+        self,
+        split: Dataset,
+        split_name: str,
+        topk_sources_by_target: dict[str, list[str]],
+    ) -> None:
+        if not self.hparams.use_template_coords:
+            return
+
+        base, indices = self._split_indices(split)
+        violations: list[tuple[str, int]] = []
+        for idx in indices:
+            example: RNAExample = base[idx]  # type: ignore[assignment]
+            source_ids = topk_sources_by_target.get(example.target_id, [])
+            k_count = int(example.template_topk_valid.shape[0])
+            for k_idx in range(k_count):
+                if not bool(example.template_topk_valid[k_idx].item()):
+                    continue
+                source_id = source_ids[k_idx] if k_idx < len(source_ids) else ""
+                if source_id == example.target_id:
+                    violations.append((example.target_id, k_idx))
+                    if len(violations) >= 10:
+                        break
+            if len(violations) >= 10:
+                break
+
+        if violations:
+            details = ", ".join([f"{tid}[k={k_idx}]" for tid, k_idx in violations])
+            raise RuntimeError(
+                f"Self-source template leakage detected in split='{split_name}'. "
+                f"Found template source == target_id in active candidates: {details}"
+            )
+
+        log.info("No self-source template candidates detected for split='%s'.", split_name)
+
+    def _filter_split_min_templates(self, split: Dataset, split_name: str, min_required: int = 1) -> Dataset:
+        if not self.hparams.use_template_coords:
+            return split
+
+        required = max(1, int(min_required))
+        base, indices = self._split_indices(split)
+        kept_indices: list[int] = []
+        dropped = 0
+
+        for idx in indices:
+            example: RNAExample = base[idx]  # type: ignore[assignment]
+            qualified = example.template_topk_valid
+            if int(qualified.sum().item()) >= required:
+                kept_indices.append(idx)
+            else:
+                dropped += 1
+
+        if not kept_indices:
+            raise RuntimeError(f"All samples dropped from split='{split_name}' after template-only filtering.")
+
+        if dropped > 0:
+            log.info(
+                "Dropped %d samples from split='%s' due to missing valid templates (required=%d).",
+                dropped,
+                split_name,
+                required,
+            )
+        return Subset(base, kept_indices)
 
     def setup(self, stage: Optional[str] = None) -> None:
         if self.trainer is not None:
@@ -622,6 +831,7 @@ class C147ADataModule(LightningDataModule):
                 template_topk_valid_by_target,
                 template_topk_identity_by_target,
                 template_topk_similarity_by_target,
+                template_topk_sources_by_target,
             ) = self._load_template_payload()
             dataset = RNAIdentityDataset(
                 labels_path=labels_path,
@@ -652,6 +862,37 @@ class C147ADataModule(LightningDataModule):
                 generator=torch.Generator().manual_seed(self.hparams.seed),
             )
 
+            train_ids, val_ids, test_ids = self._validate_disjoint_splits()
+            all_ids = train_ids | val_ids | test_ids
+            self._restrict_split_template_sources(
+                self.data_train,
+                "train",
+                topk_sources_by_target=template_topk_sources_by_target,
+                allowed_source_ids=train_ids,
+            )
+            self._validate_no_self_template_sources(
+                self.data_train,
+                "train",
+                topk_sources_by_target=template_topk_sources_by_target,
+            )
+            self._restrict_split_template_sources(
+                self.data_val,
+                "val",
+                topk_sources_by_target=template_topk_sources_by_target,
+                allowed_source_ids=all_ids,
+            )
+            self._restrict_split_template_sources(
+                self.data_test,
+                "test",
+                topk_sources_by_target=template_topk_sources_by_target,
+                allowed_source_ids=all_ids,
+            )
+            self.data_train = self._filter_split_min_templates(
+                self.data_train,
+                "train",
+                min_required=int(self.hparams.template_topk_count),
+            )
+
             # User-requested strict template coverage checks on both training and test splits.
             self._validate_split_template_coverage(self.data_train, "train")
             self._validate_split_template_coverage(self.data_test, "test")
@@ -678,6 +919,7 @@ class C147ADataModule(LightningDataModule):
                 _collate_rna_batch,
                 thermal_noise_sigma_angstrom=self.thermal_noise_sigma_angstrom,
                 add_thermal_noise=self.hparams.apply_thermal_noise_train,
+                use_template_only_inputs=self.hparams.train_use_template_only_inputs,
                 template_chunk_length=self.hparams.template_chunk_length,
                 template_chunk_stride=self.hparams.template_chunk_stride,
                 template_chunk_max_windows=self.hparams.template_chunk_max_windows,
@@ -696,6 +938,7 @@ class C147ADataModule(LightningDataModule):
                 _collate_rna_batch,
                 thermal_noise_sigma_angstrom=self.thermal_noise_sigma_angstrom,
                 add_thermal_noise=self.hparams.apply_thermal_noise_eval,
+                use_template_only_inputs=self.hparams.eval_use_template_only_inputs,
                 template_chunk_length=self.hparams.template_chunk_length,
                 template_chunk_stride=self.hparams.template_chunk_stride,
                 template_chunk_max_windows=self.hparams.template_chunk_max_windows,
@@ -714,6 +957,7 @@ class C147ADataModule(LightningDataModule):
                 _collate_rna_batch,
                 thermal_noise_sigma_angstrom=self.thermal_noise_sigma_angstrom,
                 add_thermal_noise=self.hparams.apply_thermal_noise_eval,
+                use_template_only_inputs=self.hparams.eval_use_template_only_inputs,
                 template_chunk_length=self.hparams.template_chunk_length,
                 template_chunk_stride=self.hparams.template_chunk_stride,
                 template_chunk_max_windows=self.hparams.template_chunk_max_windows,
