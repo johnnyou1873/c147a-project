@@ -753,6 +753,8 @@ def precompute_template_coords(
     top_k_store: int = 5,
     max_residues_per_target: int = 5120,
     max_targets: int | None = None,
+    query_max_targets: int | None = None,
+    search_pool_max_targets: int | None = None,
     exclude_self: bool = True,
     enforce_min_topk: bool = True,
     chunk_length: int = 512,
@@ -768,12 +770,20 @@ def precompute_template_coords(
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
+    query_max_targets_i = query_max_targets if query_max_targets is not None else max_targets
+    search_pool_max_targets_i = search_pool_max_targets if search_pool_max_targets is not None else max_targets
+
     sequences, coords_by_target = _load_sequences_and_coords(
         labels_path=labels,
         max_residues_per_target=max_residues_per_target,
-        max_targets=max_targets,
+        max_targets=search_pool_max_targets_i,
     )
     valid_target_ids = [tid for tid, c in coords_by_target.items() if _coords_are_valid(c)]
+    query_target_ids = (
+        valid_target_ids
+        if query_max_targets_i is None
+        else valid_target_ids[: max(0, int(query_max_targets_i))]
+    )
 
     top_k_store_i = max(1, int(top_k_store))
     chunk_length_i = max(1, int(chunk_length))
@@ -826,9 +836,15 @@ def precompute_template_coords(
     num_chunks_with_protenix_library_miss = 0
     num_chunks_with_oracle_fallback = 0
 
-    total_targets = len(valid_target_ids)
-    if total_targets == 0:
+    total_search_pool_targets = len(valid_target_ids)
+    total_query_targets = len(query_target_ids)
+    if total_search_pool_targets == 0:
         raise RuntimeError("No valid targets found in labels file for template precompute.")
+    if total_query_targets == 0:
+        raise RuntimeError(
+            "No query targets selected for template precompute. "
+            f"query_max_targets={query_max_targets_i}, search_pool_targets={total_search_pool_targets}."
+        )
     if abs(min_similarity_i) > 1e-8:
         log.info(
             "template_min_similarity=%.3f was provided, but similarity thresholding is disabled; "
@@ -840,7 +856,7 @@ def precompute_template_coords(
     total_windows_generated = 0
     min_windows_per_target: int | None = None
     max_windows_per_target = 0
-    for query_tid in valid_target_ids:
+    for query_tid in query_target_ids:
         q_len = len(sequences[query_tid])
         starts = _compute_chunk_starts(q_len, chunk_length_i, chunk_stride_i, chunk_max_windows_i)
         num_windows = int(len(starts))
@@ -879,7 +895,7 @@ def precompute_template_coords(
     requested_threads = int(num_threads)
     worker_threads = min(16, max(1, os.cpu_count() or 1)) if requested_threads <= 0 else max(1, requested_threads)
     worker_threads = min(worker_threads, max(1, total_chunk_tasks))
-    avg_windows_per_target = float(total_windows_generated) / float(max(1, total_targets))
+    avg_windows_per_target = float(total_windows_generated) / float(max(1, total_query_targets))
     min_windows_log = int(min_windows_per_target if min_windows_per_target is not None else 0)
 
     worker_ids_seen: set[str] = set()
@@ -892,9 +908,10 @@ def precompute_template_coords(
     last_logged_candidate_targets = 0
 
     log.info(
-        "Template precompute workset: targets=%d chunks=%d windows/target(min/avg/max)=%d/%.2f/%d "
-        "chunk_len=%d stride=%d top_k=%d threads=%d.",
-        total_targets,
+        "Template precompute workset: query_targets=%d search_pool_targets=%d chunks=%d "
+        "windows/target(min/avg/max)=%d/%.2f/%d chunk_len=%d stride=%d top_k=%d threads=%d.",
+        total_query_targets,
+        total_search_pool_targets,
         total_chunk_tasks,
         min_windows_log,
         avg_windows_per_target,
@@ -1151,11 +1168,12 @@ def precompute_template_coords(
                         protenix_candidates_used.astype(np.float32, copy=False)
                     )
     log.info(
-        "Template precompute started for %d targets (%d chunks) using %d process(es) in chunk-parallel mode "
+        "Template precompute started for %d query targets (%d chunks) with %d search-pool targets using %d process(es) in chunk-parallel mode "
         "(alignment=global, full_exhaustive_search=true, identity_gate=%.1f, ranking=similarity_desc, "
         "protenix_cache=%s, fallback=oracle_diversity_transforms).",
-        total_targets,
+        total_query_targets,
         total_chunk_tasks,
+        total_search_pool_targets,
         worker_threads,
         min_percent_identity_i,
         str(protenix_zip_i) if protenix_zip_i is not None else "disabled",
@@ -1205,7 +1223,7 @@ def precompute_template_coords(
             _log_progress(idx)
         _log_progress(total_chunk_tasks, force=True)
 
-    for query_tid in valid_target_ids:
+    for query_tid in query_target_ids:
         q_len = len(sequences[query_tid])
         consensus = np.zeros((q_len, 3), dtype=np.float32)
         weight_sum = np.zeros((q_len, 1), dtype=np.float32)
@@ -1308,7 +1326,11 @@ def precompute_template_coords(
             "alignment_mode": "global",
             "top_k_store": int(top_k_store_i),
             "max_residues_per_target": int(max_residues_per_target),
-            "max_targets": None if max_targets is None else int(max_targets),
+            "max_targets": None if query_max_targets_i is None else int(query_max_targets_i),
+            "query_max_targets": None if query_max_targets_i is None else int(query_max_targets_i),
+            "search_pool_max_targets": None
+            if search_pool_max_targets_i is None
+            else int(search_pool_max_targets_i),
             "exclude_self": bool(exclude_self),
             "enforce_min_topk": bool(enforce_min_topk),
             "allow_self_fallback": False,
@@ -1321,7 +1343,9 @@ def precompute_template_coords(
             "search_strategy": "full_exhaustive_alignment",
             "protenix_fallback_zip": None if protenix_zip_i is None else str(protenix_zip_i),
             "protenix_base_confidence": float(protenix_base_confidence_i),
-            "num_targets": int(total_targets),
+            "num_targets": int(total_query_targets),
+            "num_query_targets": int(total_query_targets),
+            "num_search_pool_targets": int(total_search_pool_targets),
             "num_chunk_tasks": int(total_chunk_tasks),
             "num_threads": int(worker_threads),
             "executor_type": "process_chunk_parallel",
@@ -1341,7 +1365,7 @@ def precompute_template_coords(
     log.info(
         "Saved chunk template payload to %s (targets=%d, self_fallback=%d, repeated_fill=%d).",
         output,
-        total_targets,
+        total_query_targets,
         num_targets_with_self_fallback,
         num_targets_with_repeated_templates,
     )
@@ -1355,7 +1379,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-file", type=str, default="template_coords.pt")
     parser.add_argument("--top-k-store", type=int, default=5)
     parser.add_argument("--max-residues-per-target", type=int, default=5120)
-    parser.add_argument("--max-targets", type=int, default=0)
+    parser.add_argument(
+        "--max-targets",
+        type=int,
+        default=0,
+        help="Legacy cap applied to both query targets and search pool targets when explicit query/search caps are unset.",
+    )
+    parser.add_argument(
+        "--query-max-targets",
+        type=int,
+        default=0,
+        help="Cap number of query targets to chunk/search/store. <=0 means no cap.",
+    )
+    parser.add_argument(
+        "--search-pool-max-targets",
+        type=int,
+        default=0,
+        help="Cap number of targets loaded into the template search pool. <=0 means no cap.",
+    )
     parser.add_argument("--chunk-length", type=int, default=512)
     parser.add_argument("--chunk-stride", type=int, default=256)
     parser.add_argument("--chunk-max-windows", type=int, default=64)
@@ -1387,6 +1428,8 @@ def main() -> None:
     labels_path = data_dir / args.labels_file
     output_path = data_dir / args.output_file
     max_targets = None if args.max_targets <= 0 else args.max_targets
+    query_max_targets = None if args.query_max_targets <= 0 else args.query_max_targets
+    search_pool_max_targets = None if args.search_pool_max_targets <= 0 else args.search_pool_max_targets
 
     precompute_template_coords(
         labels_path=labels_path,
@@ -1394,6 +1437,8 @@ def main() -> None:
         top_k_store=args.top_k_store,
         max_residues_per_target=args.max_residues_per_target,
         max_targets=max_targets,
+        query_max_targets=query_max_targets,
+        search_pool_max_targets=search_pool_max_targets,
         exclude_self=not args.include_self,
         enforce_min_topk=not args.disable_enforce_min_topk,
         chunk_length=args.chunk_length,

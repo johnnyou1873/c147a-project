@@ -240,7 +240,10 @@ class RNAIdentityDataset(Dataset[RNAExample]):
                 chunk_coords_raw = self.template_chunk_coords_by_target[target_id].detach().to(
                     dtype=torch.float32, device="cpu"
                 )
-                if chunk_coords_raw.ndim == 5 and chunk_coords_raw.shape[-1] == 3:
+                if chunk_coords_raw.ndim == 5 and int(chunk_coords_raw.shape[0]) == 1:
+                    # Backward-compatible path for payloads that accidentally stored a leading singleton dim.
+                    chunk_coords_raw = chunk_coords_raw[0]
+                if chunk_coords_raw.ndim == 4 and chunk_coords_raw.shape[-1] == 3:
                     w_take = min(self.template_chunk_max_windows, int(chunk_coords_raw.shape[0]))
                     k_take = min(self.template_topk_count, int(chunk_coords_raw.shape[1]))
                     c_take = min(self.template_chunk_length, int(chunk_coords_raw.shape[2]))
@@ -702,6 +705,7 @@ class C147ADataModule(LightningDataModule):
         val_fraction: float = 0.05,
         max_residues_per_target: int = 5120,
         max_targets: Optional[int] = None,
+        template_generation_max_targets: Optional[int] = None,
         temperature_k: float = 600.0,
         apply_thermal_noise_train: bool = True,
         apply_thermal_noise_eval: bool = False,
@@ -721,6 +725,7 @@ class C147ADataModule(LightningDataModule):
         template_protenix_fallback_zip: str = "protenix_finished_chunks_full_4gpu_2775chunks_20260309T215807Z",
         template_protenix_base_confidence: float = 0.85,
         template_force_oracle_only: bool = False,
+        allow_missing_chunk_topk_sources: bool = False,
         template_precompute_num_threads: int = 0,
         seed: int = 42,
     ) -> None:
@@ -740,6 +745,8 @@ class C147ADataModule(LightningDataModule):
         labels_path = Path(self.hparams.data_dir) / self.hparams.labels_file
         if not labels_path.exists():
             raise FileNotFoundError(f"Expected labels file at: {labels_path}")
+        # `None` means no cap: include all targets in the template search pool.
+        template_search_pool_max_targets = self.hparams.template_generation_max_targets
 
         if self.hparams.use_template_coords:
             if bool(self.hparams.template_force_oracle_only):
@@ -775,7 +782,8 @@ class C147ADataModule(LightningDataModule):
                     stored_alignment_mode = ""
                     stored_allow_self_fallback = True
                     stored_exclude_self = True
-                    stored_max_targets: int | None = None
+                    stored_query_max_targets: int | None = None
+                    stored_search_pool_max_targets: int | None = None
                     stored_max_residues = 0
                     stored_chunk_length = 0
                     stored_chunk_stride = 0
@@ -789,8 +797,17 @@ class C147ADataModule(LightningDataModule):
                             stored_alignment_mode = str(meta.get("alignment_mode", ""))
                             stored_allow_self_fallback = bool(meta.get("allow_self_fallback", True))
                             stored_exclude_self = bool(meta.get("exclude_self", True))
-                            raw_max_targets = meta.get("max_targets", None)
-                            stored_max_targets = None if raw_max_targets is None else int(raw_max_targets)
+                            raw_query_max_targets = meta.get("query_max_targets", meta.get("max_targets", None))
+                            stored_query_max_targets = (
+                                None if raw_query_max_targets is None else int(raw_query_max_targets)
+                            )
+                            raw_search_pool_max_targets = meta.get(
+                                "search_pool_max_targets",
+                                meta.get("max_targets", None),
+                            )
+                            stored_search_pool_max_targets = (
+                                None if raw_search_pool_max_targets is None else int(raw_search_pool_max_targets)
+                            )
                             stored_max_residues = int(meta.get("max_residues_per_target", 0))
                             stored_chunk_length = int(meta.get("chunk_length", 0))
                             stored_chunk_stride = int(meta.get("chunk_stride", 0))
@@ -806,13 +823,22 @@ class C147ADataModule(LightningDataModule):
                     needs_chunk_policy_upgrade = stored_chunk_policy != expected_chunk_policy
                     needs_alignment_upgrade = stored_alignment_mode != expected_alignment_mode
                     needs_search_upgrade = stored_search_strategy != expected_search_strategy
-                    desired_max_targets = self.hparams.max_targets
-                    target_coverage_insufficient = (
-                        (desired_max_targets is None and stored_max_targets is not None)
+                    desired_search_pool_max_targets = template_search_pool_max_targets
+                    desired_query_max_targets = self.hparams.max_targets
+                    search_pool_coverage_insufficient = (
+                        (desired_search_pool_max_targets is None and stored_search_pool_max_targets is not None)
                         or (
-                            desired_max_targets is not None
-                            and stored_max_targets is not None
-                            and int(stored_max_targets) < int(desired_max_targets)
+                            desired_search_pool_max_targets is not None
+                            and stored_search_pool_max_targets is not None
+                            and int(stored_search_pool_max_targets) < int(desired_search_pool_max_targets)
+                        )
+                    )
+                    query_coverage_insufficient = (
+                        (desired_query_max_targets is None and stored_query_max_targets is not None)
+                        or (
+                            desired_query_max_targets is not None
+                            and stored_query_max_targets is not None
+                            and int(stored_query_max_targets) < int(desired_query_max_targets)
                         )
                     )
                     residue_coverage_insufficient = stored_max_residues < int(self.hparams.max_residues_per_target)
@@ -829,7 +855,8 @@ class C147ADataModule(LightningDataModule):
                         or needs_search_upgrade
                         or stored_allow_self_fallback
                         or (not stored_exclude_self)
-                        or target_coverage_insufficient
+                        or search_pool_coverage_insufficient
+                        or query_coverage_insufficient
                         or residue_coverage_insufficient
                         or chunk_shape_mismatch
                     ):
@@ -840,7 +867,9 @@ class C147ADataModule(LightningDataModule):
                             "need_chunk_policy=%s, found_chunk_policy=%s, "
                             "need_alignment=%s, found_alignment=%s, "
                             "need_search=%s, found_search=%s, "
-                            "need_max_targets=%s, found_max_targets=%s, need_max_residues=%d, found_max_residues=%d, "
+                            "need_search_pool_max_targets=%s, found_search_pool_max_targets=%s, "
+                            "need_query_max_targets=%s, found_query_max_targets=%s, "
+                            "need_max_residues=%d, found_max_residues=%d, "
                             "need_chunk=(%d,%d,%d), found_chunk=(%d,%d,%d), "
                             "allow_self_fallback=%s, exclude_self=%s). "
                             "Recomputing.",
@@ -853,8 +882,10 @@ class C147ADataModule(LightningDataModule):
                             stored_alignment_mode,
                             expected_search_strategy,
                             stored_search_strategy,
-                            str(desired_max_targets),
-                            str(stored_max_targets),
+                            str(desired_search_pool_max_targets),
+                            str(stored_search_pool_max_targets),
+                            str(desired_query_max_targets),
+                            str(stored_query_max_targets),
                             int(self.hparams.max_residues_per_target),
                             stored_max_residues,
                             int(self.hparams.template_chunk_length),
@@ -872,15 +903,18 @@ class C147ADataModule(LightningDataModule):
 
             if should_precompute:
                 log.info(
-                    "Precomputing chunk template payload at %s...",
+                    "Precomputing chunk template payload at %s (query_max_targets=%s, search_pool_max_targets=%s)...",
                     template_path,
+                    str(self.hparams.max_targets),
+                    str(template_search_pool_max_targets),
                 )
                 precompute_template_coords(
                     labels_path=labels_path,
                     output_path=template_path,
                     top_k_store=self.hparams.template_topk_count,
                     max_residues_per_target=self.hparams.max_residues_per_target,
-                    max_targets=self.hparams.max_targets,
+                    query_max_targets=self.hparams.max_targets,
+                    search_pool_max_targets=template_search_pool_max_targets,
                     exclude_self=True,
                     enforce_min_topk=True,
                     chunk_length=self.hparams.template_chunk_length,
@@ -935,6 +969,25 @@ class C147ADataModule(LightningDataModule):
             chunk_topk_source_onehot = payload.get("chunk_topk_source_onehot", {})
             chunk_topk_residue_idx = payload.get("chunk_topk_residue_idx", {})
             chunk_topk_sources = payload.get("chunk_topk_sources", {})
+            chunk_topk_source_type = payload.get("chunk_topk_source_type", {})
+            if (not isinstance(chunk_topk_sources, dict) or len(chunk_topk_sources) == 0) and bool(
+                self.hparams.allow_missing_chunk_topk_sources
+            ):
+                log.warning(
+                    "Template payload at %s is missing `chunk_topk_sources`; synthesizing fallback sources "
+                    "from available chunk metadata because allow_missing_chunk_topk_sources=True.",
+                    template_path,
+                )
+                chunk_topk_sources = self._synthesize_chunk_sources(
+                    chunk_valid_by_target=chunk_topk_valid if isinstance(chunk_topk_valid, dict) else {},
+                    chunk_start_by_target=chunk_start if isinstance(chunk_start, dict) else {},
+                    chunk_identity_by_target=chunk_topk_identity if isinstance(chunk_topk_identity, dict) else {},
+                    chunk_similarity_by_target=chunk_topk_similarity if isinstance(chunk_topk_similarity, dict) else {},
+                    chunk_source_onehot_by_target=(
+                        chunk_topk_source_onehot if isinstance(chunk_topk_source_onehot, dict) else {}
+                    ),
+                    chunk_source_type_by_target=chunk_topk_source_type if isinstance(chunk_topk_source_type, dict) else {},
+                )
             return (
                 templates,
                 available,
@@ -953,6 +1006,89 @@ class C147ADataModule(LightningDataModule):
 
         log.warning("Template file at %s has unexpected format. Continuing without templates.", template_path)
         return {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+
+    def _synthesize_chunk_sources(
+        self,
+        chunk_valid_by_target: dict[str, torch.Tensor],
+        chunk_start_by_target: dict[str, torch.Tensor],
+        chunk_identity_by_target: dict[str, torch.Tensor],
+        chunk_similarity_by_target: dict[str, torch.Tensor],
+        chunk_source_onehot_by_target: dict[str, torch.Tensor],
+        chunk_source_type_by_target: dict[str, torch.Tensor],
+    ) -> dict[str, list[list[str]]]:
+        fallback: dict[str, list[list[str]]] = {}
+        for target_id, valid_t in chunk_valid_by_target.items():
+            if not isinstance(valid_t, torch.Tensor) or valid_t.ndim != 2:
+                continue
+            valid = valid_t.detach().to(dtype=torch.bool, device="cpu")
+            w_count = int(valid.shape[0])
+            k_count = int(valid.shape[1])
+            starts = chunk_start_by_target.get(target_id, None)
+            starts_t = (
+                starts.detach().to(dtype=torch.long, device="cpu")
+                if isinstance(starts, torch.Tensor) and starts.ndim == 1
+                else None
+            )
+            identity_t = chunk_identity_by_target.get(target_id, None)
+            identity = (
+                identity_t.detach().to(dtype=torch.float32, device="cpu")
+                if isinstance(identity_t, torch.Tensor) and identity_t.ndim == 2
+                else None
+            )
+            similarity_t = chunk_similarity_by_target.get(target_id, None)
+            similarity = (
+                similarity_t.detach().to(dtype=torch.float32, device="cpu")
+                if isinstance(similarity_t, torch.Tensor) and similarity_t.ndim == 2
+                else None
+            )
+            source_oh_t = chunk_source_onehot_by_target.get(target_id, None)
+            source_oh = (
+                source_oh_t.detach().to(dtype=torch.float32, device="cpu")
+                if isinstance(source_oh_t, torch.Tensor) and source_oh_t.ndim == 3 and int(source_oh_t.shape[-1]) >= 2
+                else None
+            )
+            source_type_t = chunk_source_type_by_target.get(target_id, None)
+            source_type = (
+                source_type_t.detach().to(dtype=torch.long, device="cpu")
+                if isinstance(source_type_t, torch.Tensor) and source_type_t.ndim == 2
+                else None
+            )
+
+            rows: list[list[str]] = []
+            for w_idx in range(w_count):
+                start_val = int(starts_t[w_idx].item()) if starts_t is not None and w_idx < int(starts_t.shape[0]) else 0
+                row: list[str] = []
+                for k_idx in range(k_count):
+                    if not bool(valid[w_idx, k_idx].item()):
+                        row.append("")
+                        continue
+                    is_protenix = False
+                    if source_oh is not None and w_idx < int(source_oh.shape[0]) and k_idx < int(source_oh.shape[1]):
+                        is_protenix = bool(source_oh[w_idx, k_idx, 1].item() > source_oh[w_idx, k_idx, 0].item())
+                    elif source_type is not None and w_idx < int(source_type.shape[0]) and k_idx < int(source_type.shape[1]):
+                        is_protenix = bool(int(source_type[w_idx, k_idx].item()) == 1)
+
+                    if is_protenix:
+                        row.append(f"protenix:unknown:{target_id}:{w_idx}:{k_idx}")
+                        continue
+
+                    id_val = (
+                        float(identity[w_idx, k_idx].item())
+                        if identity is not None and w_idx < int(identity.shape[0]) and k_idx < int(identity.shape[1])
+                        else 0.0
+                    )
+                    sim_val = (
+                        float(similarity[w_idx, k_idx].item())
+                        if similarity is not None and w_idx < int(similarity.shape[0]) and k_idx < int(similarity.shape[1])
+                        else 0.0
+                    )
+                    if id_val >= 99.0 and sim_val >= 0.99:
+                        row.append(f"oracle:{target_id}:{start_val}:{k_idx}")
+                    else:
+                        row.append(f"template_unknown:{target_id}:{w_idx}:{k_idx}")
+                rows.append(row)
+            fallback[target_id] = rows
+        return fallback
 
     def _validate_split_template_coverage(self, split: Dataset, split_name: str) -> None:
         if not self.hparams.use_template_coords:
@@ -1057,6 +1193,13 @@ class C147ADataModule(LightningDataModule):
         if not self.hparams.use_template_coords:
             return
         if not chunk_sources_by_target:
+            if bool(self.hparams.allow_missing_chunk_topk_sources):
+                log.warning(
+                    "Skipping strict split template-source restriction for split='%s' because "
+                    "`chunk_topk_sources` is unavailable and allow_missing_chunk_topk_sources=True.",
+                    split_name,
+                )
+                return
             raise RuntimeError(
                 "Template payload is missing `chunk_topk_sources`; cannot enforce split leakage guards for templates."
             )
@@ -1178,6 +1321,13 @@ class C147ADataModule(LightningDataModule):
         chunk_sources_by_target: dict[str, list[list[str]]],
     ) -> None:
         if not self.hparams.use_template_coords:
+            return
+        if not chunk_sources_by_target and bool(self.hparams.allow_missing_chunk_topk_sources):
+            log.warning(
+                "Skipping self-template source validation for split='%s' because `chunk_topk_sources` "
+                "is unavailable and allow_missing_chunk_topk_sources=True.",
+                split_name,
+            )
             return
 
         base, indices = self._split_indices(split)
