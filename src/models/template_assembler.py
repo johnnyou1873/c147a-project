@@ -1,667 +1,413 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from src.models.components.folding_transformer import SE3RefinementBlock
 
 
-class EGNNRefineLayer(nn.Module):
-    """Lightweight EGNN layer with sparse sequence+geometric neighborhoods."""
-
-    def __init__(
-        self,
-        hidden_dim: int,
-        seq_radius: int = 2,
-        knn: int = 16,
-        coord_step_size: float = 0.1,
-    ) -> None:
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.seq_radius = max(0, int(seq_radius))
-        self.knn = max(0, int(knn))
-        self.coord_step_size = float(coord_step_size)
-
-        self.edge_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + 1, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-        )
-        self.coord_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Tanh(),
-        )
-        self.node_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        self.h_norm = nn.LayerNorm(hidden_dim)
-
-    def _build_edges(self, coords: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build directed edges with sequence local links and geometric kNN links."""
-        n = int(coords.shape[0])
-        if n <= 1:
-            empty = torch.zeros(0, device=coords.device, dtype=torch.long)
-            return empty, empty
-
-        src_chunks: list[torch.Tensor] = []
-        dst_chunks: list[torch.Tensor] = []
-        idx = torch.arange(n, device=coords.device, dtype=torch.long)
-
-        if self.seq_radius > 0:
-            for off in range(1, self.seq_radius + 1):
-                if off >= n:
-                    break
-                s_f = idx[:-off]
-                d_f = idx[off:]
-                src_chunks.extend([s_f, d_f])
-                dst_chunks.extend([d_f, s_f])
-
-        if self.knn > 0:
-            k = min(self.knn, n - 1)
-            dist = torch.cdist(coords.to(dtype=torch.float32), coords.to(dtype=torch.float32))
-            dist.fill_diagonal_(float("inf"))
-            nn_idx = torch.topk(dist, k=k, largest=False, dim=-1).indices  # (N, k)
-            src_geo = idx.unsqueeze(1).expand(-1, k).reshape(-1)
-            dst_geo = nn_idx.reshape(-1)
-            src_chunks.append(src_geo)
-            dst_chunks.append(dst_geo)
-
-        if not src_chunks:
-            empty = torch.zeros(0, device=coords.device, dtype=torch.long)
-            return empty, empty
-
-        src = torch.cat(src_chunks, dim=0)
-        dst = torch.cat(dst_chunks, dim=0)
-        linear = src * n + dst
-        uniq = torch.unique(linear, sorted=True)
-        src = uniq // n
-        dst = uniq % n
-        return src, dst
-
-    def forward(self, hidden: torch.Tensor, coords: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        out_h = hidden.clone()
-        out_x = coords.clone()
-
-        for b in range(hidden.shape[0]):
-            valid_idx = torch.nonzero(mask[b], as_tuple=False).squeeze(-1)
-            n = int(valid_idx.numel())
-            if n <= 1:
-                continue
-
-            h_b = hidden[b, valid_idx, :]
-            x_b = coords[b, valid_idx, :]
-            src, dst = self._build_edges(x_b)
-            if src.numel() == 0:
-                continue
-
-            h_src = h_b[src]
-            h_dst = h_b[dst]
-            rel = x_b[src] - x_b[dst]
-            dist2 = torch.sum(rel * rel, dim=-1, keepdim=True)
-            msg = self.edge_mlp(torch.cat([h_src, h_dst, dist2], dim=-1))
-
-            coord_coef = self.coord_mlp(msg)
-            delta = rel * coord_coef
-            agg_delta = torch.zeros(n, 3, device=coords.device, dtype=coords.dtype)
-            agg_delta.index_add_(0, src, delta.to(dtype=agg_delta.dtype))
-            deg = torch.zeros(n, 1, device=coords.device, dtype=coords.dtype)
-            deg.index_add_(0, src, torch.ones(src.shape[0], 1, device=coords.device, dtype=coords.dtype))
-            x_new = x_b + self.coord_step_size * agg_delta / deg.clamp(min=1.0)
-
-            agg_msg = torch.zeros(n, self.hidden_dim, device=hidden.device, dtype=hidden.dtype)
-            agg_msg.index_add_(0, src, msg.to(dtype=hidden.dtype))
-            h_new = h_b + self.node_mlp(torch.cat([h_b, agg_msg], dim=-1))
-            h_new = self.h_norm(h_new)
-
-            out_h[b, valid_idx, :] = h_new
-            out_x[b, valid_idx, :] = x_new
-
-        return out_h, out_x
-
-
 class TemplateSegmentAssembler(nn.Module):
-    """Local template picker + equivariant refinement.
-
-    The model expects five candidate 3D structures per target (top identity matches).
-    It computes soft candidate selection per segment, stitches a consensus backbone,
-    then applies EGNN + a small SE(3) refinement pass.
+    """
+    Simplified chunk assembler:
+    1) 2-layer transformer scorer over [reference_token + 5 candidate tokens]
+       to produce per-token and per-window candidate weights.
+    2) Weighted window coordinate assembly + seam-score weighted Kabsch stitching.
+    3) Single refinement block: transformer OR SE(3).
     """
 
     def __init__(
         self,
         hidden_dim: int = 256,
         num_candidates: int = 5,
-        segment_length: int = 64,
-        segment_stride: int = 32,
         residue_vocab_size: int = 5,
         max_chain_embeddings: int = 64,
         max_copy_embeddings: int = 64,
-        egnn_layers: int = 3,
-        egnn_seq_radius: int = 2,
-        egnn_knn: int = 16,
-        egnn_coord_step_size: float = 0.1,
-        se3_refine_layers: int = 1,
+        template_chunk_length: int = 512,
+        template_chunk_stride: int = 256,
+        template_chunk_max_windows: int = 64,
+        seq_transformer_layers: int = 4,
+        seq_transformer_heads: int = 8,
+        sparse_block_size: int = 64,
+        sparse_window: int = 256,
+        sparse_global_stride: int = 128,
+        sparse_max_global_tokens: int = 64,
+        transformer_dropout: float = 0.0,
+        cross_attention_heads: int = 8,
+        refinement_block: str = "se3",
+        se3_refine_layers: int = 4,
         se3_num_heads: int = 4,
         se3_dropout: float = 0.0,
         se3_coord_step_size: float = 0.1,
-        template_chunk_length: int = 512,
-        template_chunk_stride: int = 256,
-        template_chunk_max_windows: int = 20,
-        hybrid_gru_layers: int = 1,
-        hybrid_gru_dropout: float = 0.0,
+        geometric_constraints_enabled: bool = False,
+        geometric_constraints_passes: int = 3,
+        geometric_constraints_strength: float = 0.75,
+        geometric_constraints_nonlocal_max_points: int = 160,
+        geometric_constraints_nonlocal_min_sep: int = 2,
+        geometric_constraints_repulsion_temp: float = 0.25,
+        local_chunk_layers: int = 4,
+        local_chunk_heads: int = 8,
+        local_chunk_attention_window: int = 64,
+        local_chunk_graph_offsets: Sequence[int] = (1, 2, 4),
+        latent_bottleneck_size: int = 128,
+        latent_refine_layers: int = 6,
+        bond_target: float = 5.95,
+        twohop_target: float = 10.2,
+        clash_min_distance: float = 3.2,
     ) -> None:
         super().__init__()
-        self.hidden_dim = hidden_dim
-        self.num_candidates = num_candidates
-        self.segment_length = max(8, int(segment_length))
-        self.segment_stride = max(1, int(segment_stride))
+        del sparse_block_size, sparse_global_stride, sparse_max_global_tokens
+        del geometric_constraints_passes, geometric_constraints_repulsion_temp
+        del local_chunk_layers, local_chunk_heads, local_chunk_attention_window, local_chunk_graph_offsets
+        del latent_bottleneck_size, latent_refine_layers
+
+        self.hidden_dim = int(hidden_dim)
+        self.num_candidates = max(1, int(num_candidates))
         self.template_chunk_length = max(1, int(template_chunk_length))
         self.template_chunk_stride = max(1, int(template_chunk_stride))
         self.template_chunk_max_windows = max(1, int(template_chunk_max_windows))
-        self.invariant_feature_dim = 8
+        self.max_sequence_positions = self.template_chunk_length + self.template_chunk_stride * max(
+            0, self.template_chunk_max_windows - 1
+        )
+        self.refinement_block = str(refinement_block).strip().lower()
+        if self.refinement_block not in {"transformer", "se3"}:
+            raise ValueError("refinement_block must be one of {'transformer', 'se3'}")
 
+        self.use_geom_aux = bool(geometric_constraints_enabled)
+        self.geom_aux_weight = float(geometric_constraints_strength)
+        self.geom_aux_max_points = max(16, int(geometric_constraints_nonlocal_max_points))
+        self.geom_aux_min_sep = max(0, int(geometric_constraints_nonlocal_min_sep))
+        self.bond_target = float(bond_target)
+        self.twohop_target = float(twohop_target)
+        self.clash_min_distance = float(clash_min_distance)
+
+        # Target-sequence context features.
         self.residue_emb = nn.Embedding(residue_vocab_size, hidden_dim)
         self.chain_emb = nn.Embedding(max_chain_embeddings, hidden_dim)
         self.copy_emb = nn.Embedding(max_copy_embeddings, hidden_dim)
         self.resid_proj = nn.Linear(1, hidden_dim)
-        self.coord_proj = nn.Linear(3, hidden_dim)
-        self.quality_proj = nn.Linear(2, hidden_dim)
-        self.hidden_norm = nn.LayerNorm(hidden_dim)
-        self.invariant_norm = nn.LayerNorm(self.invariant_feature_dim)
-        self.invariant_gru = nn.GRU(
-            input_size=self.invariant_feature_dim,
-            hidden_size=hidden_dim,
-            num_layers=max(1, int(hybrid_gru_layers)),
-            dropout=float(hybrid_gru_dropout) if int(hybrid_gru_layers) > 1 else 0.0,
-            bidirectional=True,
-            batch_first=True,
-        )
-        self.invariant_gru_proj = nn.Linear(hidden_dim * 2, hidden_dim)
-        self.invariant_gate = nn.Sequential(
-            nn.Linear(hidden_dim + self.invariant_feature_dim, hidden_dim),
+
+        # Chunk/candidate token features.
+        self.chunk_residue_emb = nn.Embedding(residue_vocab_size, hidden_dim)
+        self.chunk_pos_emb = nn.Embedding(self.template_chunk_length, hidden_dim)
+        self.window_emb = nn.Embedding(self.template_chunk_max_windows, hidden_dim)
+        self.chunk_coord_proj = nn.Linear(3, hidden_dim)
+        self.match_meta_proj = nn.Sequential(
+            nn.Linear(6, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.Sigmoid(),
         )
 
-        self.segment_scorer = nn.Sequential(
-            nn.Linear(6, hidden_dim // 2),
+        # Shared 2-layer transformer scorer (token-level + window-level use).
+        self.score_role_emb = nn.Embedding(max(8, self.num_candidates) + 1, hidden_dim)
+        self.score_norm = nn.LayerNorm(hidden_dim)
+        self.score_transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=hidden_dim,
+                nhead=max(1, int(cross_attention_heads)),
+                dim_feedforward=hidden_dim * 4,
+                dropout=float(transformer_dropout),
+                activation="gelu",
+                norm_first=True,
+                batch_first=True,
+            ),
+            num_layers=2,
+            enable_nested_tensor=False,
+        )
+        self.token_score_head = nn.Linear(hidden_dim, 1)
+        self.window_score_head = nn.Linear(hidden_dim, 1)
+
+        # Learnable seam profile for overlap stitching.
+        self.seam_logits = nn.Parameter(torch.zeros(self.template_chunk_length))
+
+        # Shared refinement context projections.
+        self.coord_context_proj = nn.Linear(3, hidden_dim)
+        self.conf_context_proj = nn.Linear(1, hidden_dim)
+        self.refine_norm = nn.LayerNorm(hidden_dim)
+        self.conf_out = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
-
-        self.egnn_layers = nn.ModuleList(
-            [
-                EGNNRefineLayer(
-                    hidden_dim=hidden_dim,
-                    seq_radius=egnn_seq_radius,
-                    knn=egnn_knn,
-                    coord_step_size=egnn_coord_step_size,
-                )
-                for _ in range(egnn_layers)
-            ]
-        )
-
-        self.se3_layers = nn.ModuleList(
-            [
-                SE3RefinementBlock(
-                    hidden_dim=hidden_dim,
-                    num_heads=se3_num_heads,
-                    dropout=se3_dropout,
-                    coord_step_size=se3_coord_step_size,
-                    use_fast_multipole=False,
-                    use_block_sparse_attention=True,
-                    block_sparse_min_seq_len=1,
-                    block_sparse_block_size=64,
-                    block_sparse_window=128,
-                    block_sparse_global_stride=128,
-                    block_sparse_max_global=32,
-                    block_sparse_geo_topk=16,
-                    pure_sparse_mode=True,
-                )
-                for _ in range(se3_refine_layers)
-            ]
-        )
-
-    def _segment_spans(self, length: int) -> list[tuple[int, int]]:
-        if length <= self.segment_length:
-            return [(0, length)]
-        spans: list[tuple[int, int]] = []
-        start = 0
-        while start < length:
-            end = min(start + self.segment_length, length)
-            spans.append((start, end))
-            if end == length:
-                break
-            start += self.segment_stride
-        last_start = max(0, length - self.segment_length)
-        if spans[-1][0] != last_start:
-            spans.append((last_start, length))
-        return spans
-
-    def _kabsch_align_to_reference(
-        self,
-        candidates: torch.Tensor,
-        reference: torch.Tensor,
-        mask: torch.Tensor,
-        valid_cands: torch.Tensor,
-    ) -> torch.Tensor:
-        aligned = candidates.clone()
-        use_fp32_linalg = candidates.device.type == "cuda" and (
-            candidates.dtype in (torch.float16, torch.bfloat16) or torch.is_autocast_enabled()
-        )
-
-        autocast_ctx = (
-            torch.autocast(device_type=candidates.device.type, enabled=False)
-            if use_fp32_linalg and candidates.device.type in {"cuda", "cpu"}
-            else nullcontext()
-        )
-        with torch.no_grad():
-            with autocast_ctx:
-                bsz, k, _, _ = candidates.shape
-                for b in range(bsz):
-                    valid_res = mask[b]
-                    if int(valid_res.sum().item()) < 3:
-                        continue
-                    target = reference[b, valid_res].to(dtype=torch.float32)
-                    target_center = target.mean(dim=0, keepdim=True)
-                    target_centered = target - target_center
-
-                    for c in range(k):
-                        if not bool(valid_cands[b, c].item()):
-                            continue
-                        pred_sel = candidates[b, c, valid_res].to(dtype=torch.float32)
-                        if pred_sel.shape[0] < 3:
-                            continue
-                        pred_center = pred_sel.mean(dim=0, keepdim=True)
-                        pred_centered = pred_sel - pred_center
-
-                        cov = pred_centered.transpose(0, 1) @ target_centered
-                        u, _, vh = torch.linalg.svd(cov, full_matrices=False)
-                        r = vh.transpose(0, 1) @ u.transpose(0, 1)
-                        if torch.det(r) < 0:
-                            vh_fix = vh.clone()
-                            vh_fix[-1, :] *= -1
-                            r = vh_fix.transpose(0, 1) @ u.transpose(0, 1)
-
-                        pred_all = candidates[b, c].to(dtype=torch.float32)
-                        pred_all_aligned = (pred_all - pred_center) @ r + target_center
-                        aligned[b, c] = pred_all_aligned.to(dtype=aligned.dtype)
-        return aligned
-
-    def _prepare_candidates(
-        self,
-        coords: torch.Tensor,
-        mask: torch.Tensor,
-        template_coords: Optional[torch.Tensor],
-        template_mask: Optional[torch.Tensor],
-        template_topk_coords: Optional[torch.Tensor],
-        template_topk_mask: Optional[torch.Tensor],
-        template_topk_valid: Optional[torch.Tensor],
-        template_topk_identity: Optional[torch.Tensor],
-        template_topk_similarity: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        bsz, seq_len, _ = coords.shape
-        k = self.num_candidates
-
-        candidates = coords.unsqueeze(1).repeat(1, k, 1, 1)
-        valid = torch.zeros(bsz, k, device=coords.device, dtype=torch.bool)
-        cand_identity = torch.zeros(bsz, k, device=coords.device, dtype=coords.dtype)
-        cand_similarity = torch.zeros(bsz, k, device=coords.device, dtype=coords.dtype)
-        valid[:, 0] = True
-        cand_identity[:, 0] = 100.0
-        cand_similarity[:, 0] = 1.0
-
-        if template_topk_coords is not None:
-            topk = template_topk_coords
-            if topk.dim() != 4:
-                raise ValueError("template_topk_coords must have shape (B,K,L,3) or (B,L,K,3)")
-            if topk.shape[1] == seq_len and topk.shape[2] != seq_len:
-                topk = topk.permute(0, 2, 1, 3)
-            if topk.shape[2] != seq_len:
-                raise ValueError("template_topk_coords sequence length does not match coords.")
-
-            use_k = min(k, topk.shape[1])
-            candidates[:, :use_k] = topk[:, :use_k]
-
-            if template_topk_valid is not None and template_topk_valid.dim() == 2:
-                valid[:, :use_k] = template_topk_valid[:, :use_k].to(dtype=torch.bool, device=coords.device)
-            elif template_topk_mask is not None and template_topk_mask.dim() == 3:
-                # (B, K, L) availability-by-token
-                valid[:, :use_k] = template_topk_mask[:, :use_k].any(dim=-1).to(dtype=torch.bool, device=coords.device)
-            else:
-                valid[:, :use_k] = True
-
-            if template_topk_identity is not None and template_topk_identity.dim() == 2:
-                cand_identity[:, :use_k] = template_topk_identity[:, :use_k].to(dtype=coords.dtype, device=coords.device)
-            if template_topk_similarity is not None and template_topk_similarity.dim() == 2:
-                cand_similarity[:, :use_k] = template_topk_similarity[:, :use_k].to(
-                    dtype=coords.dtype, device=coords.device
-                )
-        elif template_coords is not None:
-            candidates[:, 1] = template_coords
-            if template_mask is not None:
-                valid[:, 1] = template_mask.any(dim=-1).to(dtype=torch.bool, device=coords.device)
-            else:
-                valid[:, 1] = True
-
-        # Guarantee at least one valid candidate.
-        empty_rows = ~valid.any(dim=1)
-        if bool(empty_rows.any()):
-            candidates[empty_rows, 0] = coords[empty_rows]
-            valid[empty_rows, 0] = True
-            cand_identity[empty_rows, 0] = 100.0
-            cand_similarity[empty_rows, 0] = 1.0
-
-        candidates = self._kabsch_align_to_reference(candidates, coords, mask, valid)
-        return candidates, valid, cand_identity, cand_similarity
-
-    def _segment_logits(
-        self,
-        candidates: torch.Tensor,
-        coords: torch.Tensor,
-        mask: torch.Tensor,
-        valid: torch.Tensor,
-        cand_identity: torch.Tensor,
-        cand_similarity: torch.Tensor,
-    ) -> tuple[torch.Tensor, list[tuple[int, int]]]:
-        bsz, k, seq_len, _ = candidates.shape
-        spans = self._segment_spans(seq_len)
-        logits_all = []
-        valid_f = valid.float()
-        valid_norm = valid_f.sum(dim=1, keepdim=True).clamp(min=1.0)
-
-        for start, end in spans:
-            seg_mask = mask[:, start:end].float()  # (B, S)
-            seg_len = seg_mask.sum(dim=1, keepdim=True).clamp(min=1.0)  # (B, 1)
-            seg_coords = candidates[:, :, start:end, :]  # (B,K,S,3)
-            seg_mean = (seg_coords * seg_mask[:, None, :, None]).sum(dim=2) / seg_len.unsqueeze(-1)
-
-            input_seg = coords[:, start:end, :]
-            input_seg_mean = (input_seg * seg_mask[:, :, None]).sum(dim=1) / seg_len
-
-            consensus_seg = (seg_mean * valid_f[:, :, None]).sum(dim=1) / valid_norm
-            dev_consensus = torch.linalg.norm(seg_mean - consensus_seg[:, None, :], dim=-1)
-            dev_input = torch.linalg.norm(seg_mean - input_seg_mean[:, None, :], dim=-1)
-            sq_dist = ((seg_coords - seg_mean[:, :, None, :]) ** 2).sum(dim=-1)  # (B,K,S)
-            seg_spread = torch.sqrt(
-                (sq_dist * seg_mask[:, None, :]).sum(dim=-1) / seg_len + 1e-6
-            )
-            id_feat = (cand_identity / 100.0).clamp(min=0.0, max=1.5)
-            sim_feat = cand_similarity.clamp(min=0.0, max=2.0)
-
-            feat = torch.stack(
+        if self.refinement_block == "transformer":
+            self.global_layers = nn.ModuleList(
                 [
-                    -dev_consensus,
-                    -dev_input,
-                    -seg_spread,
-                    valid_f,
-                    id_feat,
-                    sim_feat,
-                ],
-                dim=-1,
-            )  # (B,K,6)
-            seg_logits = self.segment_scorer(feat).squeeze(-1)  # (B,K)
-            seg_logits = seg_logits.masked_fill(~valid, -1e4)
-            logits_all.append(seg_logits)
-
-        return torch.stack(logits_all, dim=1), spans  # (B,M,K)
-
-    def _stitch_consensus(
-        self,
-        candidates: torch.Tensor,
-        seg_logits: torch.Tensor,
-        spans: list[tuple[int, int]],
-        mask: torch.Tensor,
-        valid: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        bsz, k, seq_len, _ = candidates.shape
-        logits_acc = torch.zeros(bsz, seq_len, k, device=candidates.device, dtype=candidates.dtype)
-        counts = torch.zeros(bsz, seq_len, 1, device=candidates.device, dtype=candidates.dtype)
-
-        for seg_idx, (start, end) in enumerate(spans):
-            logits_acc[:, start:end, :] += seg_logits[:, seg_idx, :].unsqueeze(1)
-            counts[:, start:end, :] += 1.0
-
-        res_logits = logits_acc / counts.clamp(min=1.0)
-        res_logits = res_logits.masked_fill(~valid.unsqueeze(1), -1e4)
-        weights = torch.softmax(res_logits, dim=-1)  # (B,L,K)
-        weights = weights * mask.unsqueeze(-1).float()
-        weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1e-6)
-
-        cand_l = candidates.permute(0, 2, 1, 3)  # (B,L,K,3)
-        consensus = torch.sum(weights.unsqueeze(-1) * cand_l, dim=2)  # (B,L,3)
-        return consensus, weights
-
-    def _build_global_invariants(
-        self,
-        candidates: torch.Tensor,
-        weights: torch.Tensor,
-        cand_identity: torch.Tensor,
-        cand_similarity: torch.Tensor,
-        consensus: torch.Tensor,
-        coords: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        cand_l = candidates.permute(0, 2, 1, 3)  # (B,L,K,3)
-        d2_consensus = ((cand_l - consensus.unsqueeze(2)) ** 2).sum(dim=-1)  # (B,L,K)
-        spread = torch.sqrt((weights * d2_consensus).sum(dim=-1).clamp(min=1e-6))  # (B,L)
-        displacement = torch.linalg.norm(consensus - coords, dim=-1)  # (B,L)
-        id_feat = (weights * (cand_identity / 100.0).unsqueeze(1)).sum(dim=-1)  # (B,L)
-        sim_feat = (weights * cand_similarity.unsqueeze(1)).sum(dim=-1)  # (B,L)
-        confidence = weights.max(dim=-1).values  # (B,L)
-        entropy = -(weights.clamp(min=1e-8) * weights.clamp(min=1e-8).log()).sum(dim=-1)  # (B,L)
-        coverage = mask.float()  # Global path covers all valid tokens.
-
-        inv = torch.stack(
-            [
-                confidence,
-                entropy,
-                id_feat.clamp(min=0.0, max=1.5),
-                sim_feat.clamp(min=0.0, max=2.0),
-                displacement,
-                spread,
-                coverage,
-                mask.float(),
-            ],
-            dim=-1,
-        )  # (B,L,8)
-        return inv
-
-    def _apply_invariant_gru(
-        self, hidden: torch.Tensor, invariant_features: torch.Tensor, mask: torch.Tensor
-    ) -> torch.Tensor:
-        inv = self.invariant_norm(invariant_features.to(dtype=hidden.dtype))
-        lengths = mask.sum(dim=-1).to(dtype=torch.long)
-
-        if int(lengths.min().item()) <= 0:
-            gru_out, _ = self.invariant_gru(inv)
+                    nn.TransformerEncoderLayer(
+                        d_model=hidden_dim,
+                        nhead=max(1, int(seq_transformer_heads)),
+                        dim_feedforward=hidden_dim * 4,
+                        dropout=float(transformer_dropout),
+                        activation="gelu",
+                        norm_first=True,
+                        batch_first=True,
+                    )
+                    for _ in range(max(1, int(seq_transformer_layers)))
+                ]
+            )
+            self.coord_delta_head: Optional[nn.Linear] = nn.Linear(hidden_dim, 3)
+            self.coord_to_hidden: Optional[nn.Linear] = None
+            self.se3_layers = nn.ModuleList()
         else:
-            packed = nn.utils.rnn.pack_padded_sequence(
-                inv,
-                lengths=lengths.detach().cpu(),
-                batch_first=True,
-                enforce_sorted=False,
-            )
-            packed_out, _ = self.invariant_gru(packed)
-            gru_out, _ = nn.utils.rnn.pad_packed_sequence(
-                packed_out,
-                batch_first=True,
-                total_length=hidden.shape[1],
+            self.global_layers = nn.ModuleList()
+            self.coord_delta_head = None
+            self.coord_to_hidden = nn.Linear(3, hidden_dim)
+            self.se3_layers = nn.ModuleList(
+                [
+                    SE3RefinementBlock(
+                        hidden_dim=hidden_dim,
+                        num_heads=max(1, int(se3_num_heads)),
+                        dropout=float(se3_dropout),
+                        coord_step_size=float(se3_coord_step_size),
+                        use_fast_multipole=False,
+                        use_block_sparse_attention=True,
+                        block_sparse_min_seq_len=1,
+                        block_sparse_block_size=64,
+                        block_sparse_window=max(1, int(sparse_window)),
+                        block_sparse_global_stride=128,
+                        block_sparse_max_global=64,
+                        block_sparse_geo_topk=16,
+                        pure_sparse_mode=True,
+                    )
+                    for _ in range(max(1, int(se3_refine_layers)))
+                ]
             )
 
-        gru_hidden = self.invariant_gru_proj(gru_out)
-        gate = self.invariant_gate(torch.cat([hidden, inv], dim=-1))
-        fused = hidden + gate * gru_hidden
-        fused = fused * mask.unsqueeze(-1).float()
-        return fused
+        self.last_aux_losses: dict[str, torch.Tensor] = {}
+        self.last_confidence: Optional[torch.Tensor] = None
+        self.last_overlap_compatibility: Optional[torch.Tensor] = None
+        self.last_window_candidate_scores: Optional[torch.Tensor] = None
+        self.last_token_candidate_scores: Optional[torch.Tensor] = None
 
-    def _stitch_chunk_consensus(
+    def _prepare_chunk_inputs(
         self,
         coords: torch.Tensor,
         mask: torch.Tensor,
-        template_chunk_coords: torch.Tensor,
+        residue_idx: torch.Tensor,
+        template_chunk_coords: Optional[torch.Tensor],
         template_chunk_mask: Optional[torch.Tensor],
         template_chunk_start: Optional[torch.Tensor],
         template_chunk_window_valid: Optional[torch.Tensor],
         template_chunk_valid: Optional[torch.Tensor],
         template_chunk_identity: Optional[torch.Tensor],
         template_chunk_similarity: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        bsz, seq_len, _ = coords.shape
-        _, max_windows, k, chunk_len, _ = template_chunk_coords.shape
+        template_chunk_confidence: Optional[torch.Tensor],
+        template_chunk_source_onehot: Optional[torch.Tensor],
+        template_chunk_residue_idx: Optional[torch.Tensor],
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        b, l, _ = coords.shape
+        if template_chunk_coords is None or template_chunk_coords.dim() != 5:
+            c = torch.zeros(
+                b,
+                1,
+                self.num_candidates,
+                self.template_chunk_length,
+                3,
+                device=coords.device,
+                dtype=coords.dtype,
+            )
+            chunk_mask = torch.zeros(b, 1, self.template_chunk_length, device=coords.device, dtype=torch.bool)
+            chunk_start = torch.zeros(b, 1, device=coords.device, dtype=torch.long)
+            chunk_window_valid = torch.zeros(b, 1, device=coords.device, dtype=torch.bool)
+            chunk_valid = torch.zeros(b, 1, self.num_candidates, device=coords.device, dtype=torch.bool)
+            chunk_identity = torch.zeros(b, 1, self.num_candidates, device=coords.device, dtype=coords.dtype)
+            chunk_similarity = torch.zeros(b, 1, self.num_candidates, device=coords.device, dtype=coords.dtype)
+            chunk_conf = torch.zeros(b, 1, self.num_candidates, device=coords.device, dtype=coords.dtype)
+            chunk_source = torch.zeros(b, 1, self.num_candidates, 2, device=coords.device, dtype=coords.dtype)
+            chunk_residue = torch.full(
+                (b, 1, self.num_candidates, self.template_chunk_length),
+                4,
+                device=coords.device,
+                dtype=torch.long,
+            )
+            for bi in range(b):
+                take = min(self.template_chunk_length, int(mask[bi].sum().item()), l)
+                if take <= 0:
+                    continue
+                c[bi, 0, 0, :take] = coords[bi, :take]
+                chunk_mask[bi, 0, :take] = True
+                chunk_window_valid[bi, 0] = True
+                chunk_valid[bi, 0, 0] = True
+                chunk_identity[bi, 0, 0] = 100.0
+                chunk_similarity[bi, 0, 0] = 1.0
+                chunk_source[bi, 0, 0, 0] = 1.0
+                chunk_residue[bi, 0, 0, :take] = residue_idx[bi, :take]
+            return (
+                c,
+                chunk_mask,
+                chunk_start,
+                chunk_window_valid,
+                chunk_valid,
+                chunk_identity,
+                chunk_similarity,
+                chunk_conf,
+                chunk_source,
+                chunk_residue,
+            )
 
-        coords_sum = torch.zeros_like(coords)
-        counts = torch.zeros(bsz, seq_len, 1, device=coords.device, dtype=coords.dtype)
-        conf_sum = torch.zeros_like(counts)
-        ent_sum = torch.zeros_like(counts)
-        quality_counts = torch.zeros_like(counts)
-        id_sum = torch.zeros_like(counts)
-        sim_sum = torch.zeros_like(counts)
-        disp_sum = torch.zeros_like(counts)
-        spread_sum = torch.zeros_like(counts)
+        c = template_chunk_coords.to(device=coords.device, dtype=coords.dtype)
+        w_take = min(c.shape[1], self.template_chunk_max_windows)
+        k_take = min(c.shape[2], self.num_candidates)
+        c = c[:, :w_take, :k_take]
+        _, w, k, clen, _ = c.shape
 
-        full_true_mask = torch.ones(1, chunk_len, device=coords.device, dtype=torch.bool)
+        chunk_mask = (
+            torch.ones(b, w, clen, device=coords.device, dtype=torch.bool)
+            if template_chunk_mask is None
+            else template_chunk_mask[:, :w, :clen].to(device=coords.device, dtype=torch.bool)
+        )
+        chunk_start = (
+            torch.arange(w, device=coords.device, dtype=torch.long).unsqueeze(0).expand(b, -1) * self.template_chunk_stride
+            if template_chunk_start is None
+            else template_chunk_start[:, :w].to(device=coords.device, dtype=torch.long)
+        )
+        chunk_window_valid = (
+            chunk_mask.any(dim=-1)
+            if template_chunk_window_valid is None
+            else template_chunk_window_valid[:, :w].to(device=coords.device, dtype=torch.bool)
+        )
+        chunk_valid = (
+            torch.ones(b, w, k, device=coords.device, dtype=torch.bool)
+            if template_chunk_valid is None
+            else template_chunk_valid[:, :w, :k].to(device=coords.device, dtype=torch.bool)
+        )
+        chunk_identity = (
+            torch.zeros(b, w, k, device=coords.device, dtype=coords.dtype)
+            if template_chunk_identity is None
+            else template_chunk_identity[:, :w, :k].to(device=coords.device, dtype=coords.dtype)
+        )
+        chunk_similarity = (
+            torch.zeros(b, w, k, device=coords.device, dtype=coords.dtype)
+            if template_chunk_similarity is None
+            else template_chunk_similarity[:, :w, :k].to(device=coords.device, dtype=coords.dtype)
+        )
+        chunk_conf = (
+            torch.zeros(b, w, k, device=coords.device, dtype=coords.dtype)
+            if template_chunk_confidence is None
+            else template_chunk_confidence[:, :w, :k].to(device=coords.device, dtype=coords.dtype)
+        )
+        if template_chunk_source_onehot is None:
+            chunk_source = torch.zeros(b, w, k, 2, device=coords.device, dtype=coords.dtype)
+            chunk_source[..., 0] = 1.0
+        else:
+            chunk_source = template_chunk_source_onehot[:, :w, :k, :2].to(device=coords.device, dtype=coords.dtype)
+        if template_chunk_residue_idx is None:
+            chunk_residue = torch.full((b, w, k, clen), 4, device=coords.device, dtype=torch.long)
+        else:
+            chunk_residue = template_chunk_residue_idx[:, :w, :k, :clen].to(device=coords.device, dtype=torch.long)
 
-        for b in range(bsz):
-            valid_len = int(mask[b].sum().item())
-            if valid_len <= 0:
+        return (
+            c,
+            chunk_mask,
+            chunk_start,
+            chunk_window_valid,
+            chunk_valid,
+            chunk_identity,
+            chunk_similarity,
+            chunk_conf,
+            chunk_source,
+            chunk_residue,
+        )
+
+    def _normalize_candidate_probs(self, logits: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        logits = logits.masked_fill(~valid, -1e4)
+        probs = torch.softmax(logits, dim=-1) * valid.float()
+        denom = probs.sum(dim=-1, keepdim=True)
+        fallback = valid.float()
+        fallback_denom = fallback.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        return torch.where(denom > 1e-6, probs / denom.clamp(min=1e-6), fallback / fallback_denom)
+
+    def _weighted_kabsch_transform(
+        self,
+        source: torch.Tensor,
+        target: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (R, t) for row-vector transform: x' = x @ R.T + t."""
+        device = source.device
+        dtype = source.dtype
+        eye = torch.eye(3, device=device, dtype=dtype)
+        zero = torch.zeros(3, device=device, dtype=dtype)
+
+        if source.ndim != 2 or target.ndim != 2 or source.shape != target.shape or source.shape[-1] != 3:
+            return eye, zero
+        if int(source.shape[0]) < 3:
+            return eye, zero
+
+        w = weights.reshape(-1, 1).to(device=device, dtype=torch.float32).clamp(min=0.0)
+        w_sum = w.sum()
+        if not bool((w_sum > 1e-6).item()):
+            return eye, zero
+
+        src = source.to(dtype=torch.float32)
+        tgt = target.to(dtype=torch.float32)
+        mu_src = (w * src).sum(dim=0) / w_sum
+        mu_tgt = (w * tgt).sum(dim=0) / w_sum
+        src_c = src - mu_src
+        tgt_c = tgt - mu_tgt
+        cov = (w * src_c).transpose(0, 1) @ tgt_c
+
+        try:
+            u, _, vh = torch.linalg.svd(cov, full_matrices=False)
+        except Exception:
+            return eye, zero
+
+        r = vh.transpose(0, 1) @ u.transpose(0, 1)
+        if bool((torch.det(r) < 0).item()):
+            vh_fix = vh.clone()
+            vh_fix[-1, :] *= -1.0
+            r = vh_fix.transpose(0, 1) @ u.transpose(0, 1)
+
+        t = mu_tgt - (mu_src @ r.transpose(0, 1))
+        return r.to(dtype=dtype), t.to(dtype=dtype)
+
+    def _compute_geom_aux(self, pred: torch.Tensor, mask: torch.Tensor) -> dict[str, torch.Tensor]:
+        device = pred.device
+        dtype = pred.dtype
+        out: dict[str, torch.Tensor] = {}
+        if pred.shape[1] >= 2:
+            v = mask[:, 1:] & mask[:, :-1]
+            d = torch.linalg.norm(pred[:, 1:] - pred[:, :-1], dim=-1)
+            out["bond_length"] = (((d - self.bond_target) ** 2) * v.float()).sum() / v.float().sum().clamp(min=1.0)
+        else:
+            out["bond_length"] = torch.zeros((), device=device, dtype=dtype)
+        if pred.shape[1] >= 3:
+            v = mask[:, 2:] & mask[:, :-2]
+            d = torch.linalg.norm(pred[:, 2:] - pred[:, :-2], dim=-1)
+            out["twohop_length"] = (((d - self.twohop_target) ** 2) * v.float()).sum() / v.float().sum().clamp(min=1.0)
+        else:
+            out["twohop_length"] = torch.zeros((), device=device, dtype=dtype)
+        clash = []
+        for b_idx in range(pred.shape[0]):
+            idx = torch.nonzero(mask[b_idx], as_tuple=False).squeeze(-1)
+            if idx.numel() < 4:
                 continue
+            if idx.numel() > self.geom_aux_max_points:
+                keep = torch.linspace(0, idx.numel() - 1, steps=self.geom_aux_max_points, device=device).round().long()
+                idx = idx[keep]
+            p = pred[b_idx, idx]
+            dist = torch.linalg.norm(p[:, None, :] - p[None, :, :], dim=-1).clamp(min=1e-6)
+            sep = (idx[:, None] - idx[None, :]).abs()
+            v = sep > self.geom_aux_min_sep
+            clash.append((torch.relu(self.clash_min_distance - dist) * v.float()).sum() / v.float().sum().clamp(min=1.0))
+        out["clash"] = torch.stack(clash).mean() if clash else torch.zeros((), device=device, dtype=dtype)
+        out["total"] = (out["bond_length"] + out["twohop_length"] + out["clash"]) * self.geom_aux_weight
+        return out
 
-            for w in range(max_windows):
-                if template_chunk_window_valid is not None and not bool(template_chunk_window_valid[b, w].item()):
-                    continue
-
-                if template_chunk_start is not None:
-                    start = int(template_chunk_start[b, w].item())
-                else:
-                    start = min(w * self.template_chunk_stride, max(0, valid_len - self.template_chunk_length))
-                if start >= valid_len:
-                    continue
-
-                if template_chunk_mask is not None:
-                    win_len = int(template_chunk_mask[b, w].sum().item())
-                else:
-                    win_len = min(chunk_len, valid_len - start)
-                win_len = max(0, min(win_len, valid_len - start, chunk_len))
-                if win_len <= 0:
-                    continue
-                end = start + win_len
-
-                cand_coords = template_chunk_coords[b, w, :, :win_len]  # (K,S,3)
-                if template_chunk_valid is not None:
-                    cand_valid = template_chunk_valid[b, w].to(dtype=torch.bool, device=coords.device)
-                else:
-                    cand_valid = torch.ones(k, dtype=torch.bool, device=coords.device)
-
-                cand_identity = torch.zeros(k, device=coords.device, dtype=coords.dtype)
-                cand_similarity = torch.zeros(k, device=coords.device, dtype=coords.dtype)
-                if template_chunk_identity is not None:
-                    cand_identity = template_chunk_identity[b, w].to(dtype=coords.dtype, device=coords.device)
-                if template_chunk_similarity is not None:
-                    cand_similarity = template_chunk_similarity[b, w].to(dtype=coords.dtype, device=coords.device)
-
-                if not bool(cand_valid.any().item()):
-                    # Fallback to no-change chunk if all template candidates are missing.
-                    cand_valid = cand_valid.clone()
-                    cand_valid[0] = True
-                    cand_coords = cand_coords.clone()
-                    cand_coords[0] = coords[b, start:end]
-                    cand_identity[0] = 100.0
-                    cand_similarity[0] = 1.0
-
-                chunk_input = coords[b, start:end]
-                aligned = self._kabsch_align_to_reference(
-                    candidates=cand_coords.unsqueeze(0),
-                    reference=chunk_input.unsqueeze(0),
-                    mask=full_true_mask[:, :win_len],
-                    valid_cands=cand_valid.unsqueeze(0),
-                )[0]
-
-                cand_mean = aligned.mean(dim=1)  # (K,3)
-                input_mean = chunk_input.mean(dim=0, keepdim=False)  # (3,)
-                valid_f = cand_valid.float()
-                valid_norm = valid_f.sum().clamp(min=1.0)
-                consensus_mean = (cand_mean * valid_f[:, None]).sum(dim=0) / valid_norm
-                dev_consensus = torch.linalg.norm(cand_mean - consensus_mean[None, :], dim=-1)
-                dev_input = torch.linalg.norm(cand_mean - input_mean[None, :], dim=-1)
-                spread = torch.sqrt(((aligned - cand_mean[:, None, :]) ** 2).sum(dim=-1).mean(dim=-1) + 1e-6)
-                id_feat = (cand_identity / 100.0).clamp(min=0.0, max=1.5)
-                sim_feat = cand_similarity.clamp(min=0.0, max=2.0)
-
-                feat = torch.stack(
-                    [
-                        -dev_consensus,
-                        -dev_input,
-                        -spread,
-                        valid_f,
-                        id_feat,
-                        sim_feat,
-                    ],
-                    dim=-1,
-                )  # (K,6)
-                logits = self.segment_scorer(feat).squeeze(-1)
-                logits = logits.masked_fill(~cand_valid, -1e4)
-                weights = torch.softmax(logits, dim=0)  # (K,)
-
-                fused = torch.sum(weights[:, None, None] * aligned, dim=0)  # (S,3)
-                coords_sum[b, start:end] += fused
-                counts[b, start:end] += 1.0
-
-                conf_val = weights.max()
-                ent_val = -(weights.clamp(min=1e-8) * weights.clamp(min=1e-8).log()).sum()
-                conf_sum[b, start:end] += conf_val
-                ent_sum[b, start:end] += ent_val
-                quality_counts[b, start:end] += 1.0
-
-                weighted_id = torch.sum(weights * (cand_identity / 100.0).clamp(min=0.0, max=1.5))
-                weighted_sim = torch.sum(weights * cand_similarity.clamp(min=0.0, max=2.0))
-                weighted_spread = torch.sum(weights * spread)
-                disp_tok = torch.linalg.norm(fused - chunk_input, dim=-1, keepdim=True)
-                id_sum[b, start:end] += weighted_id
-                sim_sum[b, start:end] += weighted_sim
-                spread_sum[b, start:end] += weighted_spread
-                disp_sum[b, start:end] += disp_tok
-
-        consensus = torch.where(counts > 0, coords_sum / counts.clamp(min=1e-6), coords)
-        confidence = torch.where(
-            quality_counts > 0, conf_sum / quality_counts.clamp(min=1e-6), torch.ones_like(conf_sum)
-        )
-        entropy = torch.where(quality_counts > 0, ent_sum / quality_counts.clamp(min=1e-6), torch.zeros_like(ent_sum))
-        id_feat = torch.where(quality_counts > 0, id_sum / quality_counts.clamp(min=1e-6), torch.ones_like(id_sum))
-        sim_feat = torch.where(quality_counts > 0, sim_sum / quality_counts.clamp(min=1e-6), torch.zeros_like(sim_sum))
-        spread_feat = torch.where(
-            quality_counts > 0, spread_sum / quality_counts.clamp(min=1e-6), torch.zeros_like(spread_sum)
-        )
-        disp_feat = torch.where(quality_counts > 0, disp_sum / quality_counts.clamp(min=1e-6), torch.zeros_like(disp_sum))
-
-        coverage = torch.zeros_like(counts)
-        max_cover = counts.amax(dim=1, keepdim=True).clamp(min=1.0)
-        coverage = counts / max_cover
-
-        quality = torch.cat([confidence, entropy], dim=-1)
-        invariant_features = torch.cat(
-            [
-                confidence,
-                entropy,
-                id_feat.clamp(min=0.0, max=1.5),
-                sim_feat.clamp(min=0.0, max=2.0),
-                disp_feat,
-                spread_feat,
-                coverage,
-                mask.unsqueeze(-1).float(),
-            ],
-            dim=-1,
-        )  # (B,L,8)
-        return consensus, quality, invariant_features
+    def get_aux_losses(self) -> dict[str, torch.Tensor]:
+        return self.last_aux_losses
 
     def forward(
         self,
@@ -678,6 +424,7 @@ class TemplateSegmentAssembler(nn.Module):
         template_topk_valid: Optional[torch.Tensor] = None,
         template_topk_identity: Optional[torch.Tensor] = None,
         template_topk_similarity: Optional[torch.Tensor] = None,
+        template_topk_residue_idx: Optional[torch.Tensor] = None,
         template_chunk_coords: Optional[torch.Tensor] = None,
         template_chunk_mask: Optional[torch.Tensor] = None,
         template_chunk_start: Optional[torch.Tensor] = None,
@@ -685,90 +432,281 @@ class TemplateSegmentAssembler(nn.Module):
         template_chunk_valid: Optional[torch.Tensor] = None,
         template_chunk_identity: Optional[torch.Tensor] = None,
         template_chunk_similarity: Optional[torch.Tensor] = None,
+        template_chunk_confidence: Optional[torch.Tensor] = None,
+        template_chunk_source_onehot: Optional[torch.Tensor] = None,
+        template_chunk_residue_idx: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        residue_idx = residue_idx.clamp_(min=0, max=self.residue_emb.num_embeddings - 1)
-        chain_idx = chain_idx.clamp_(min=0, max=self.chain_emb.num_embeddings - 1)
-        copy_idx = copy_idx.clamp_(min=0, max=self.copy_emb.num_embeddings - 1)
+        del template_coords, template_mask, template_topk_coords, template_topk_mask
+        del template_topk_valid, template_topk_identity, template_topk_similarity, template_topk_residue_idx
 
-        if template_chunk_coords is not None and template_chunk_coords.dim() == 5:
-            consensus, quality, invariant_features = self._stitch_chunk_consensus(
-                coords=coords,
-                mask=mask,
-                template_chunk_coords=template_chunk_coords,
-                template_chunk_mask=template_chunk_mask,
-                template_chunk_start=template_chunk_start,
-                template_chunk_window_valid=template_chunk_window_valid,
-                template_chunk_valid=template_chunk_valid,
-                template_chunk_identity=template_chunk_identity,
-                template_chunk_similarity=template_chunk_similarity,
-            )
-        else:
-            candidates, valid, cand_identity, cand_similarity = self._prepare_candidates(
-                coords=coords,
-                mask=mask,
-                template_coords=template_coords,
-                template_mask=template_mask,
-                template_topk_coords=template_topk_coords,
-                template_topk_mask=template_topk_mask,
-                template_topk_valid=template_topk_valid,
-                template_topk_identity=template_topk_identity,
-                template_topk_similarity=template_topk_similarity,
+        b, l, _ = coords.shape
+        if l > self.max_sequence_positions:
+            raise ValueError(
+                f"Sequence length {l} exceeds architectural limit {self.max_sequence_positions} "
+                f"(chunk_length={self.template_chunk_length}, stride={self.template_chunk_stride}, max_windows={self.template_chunk_max_windows})."
             )
 
-            seg_logits, spans = self._segment_logits(
-                candidates=candidates,
-                coords=coords,
-                mask=mask,
-                valid=valid,
-                cand_identity=cand_identity,
-                cand_similarity=cand_similarity,
-            )
-            consensus, cand_weights = self._stitch_consensus(
-                candidates=candidates,
-                seg_logits=seg_logits,
-                spans=spans,
-                mask=mask,
-                valid=valid,
-            )
+        rid = residue_idx.clamp(min=0, max=self.residue_emb.num_embeddings - 1)
+        cid = chain_idx.clamp(min=0, max=self.chain_emb.num_embeddings - 1)
+        pid = copy_idx.clamp(min=0, max=self.copy_emb.num_embeddings - 1)
+        seq_embed = (
+            self.residue_emb(rid)
+            + self.chain_emb(cid)
+            + self.copy_emb(pid)
+            + self.resid_proj(resid.unsqueeze(-1).to(dtype=coords.dtype))
+        ) * mask.unsqueeze(-1).float()
 
-            confidence = cand_weights.max(dim=-1).values.unsqueeze(-1)
-            entropy = -(cand_weights.clamp(min=1e-8) * cand_weights.clamp(min=1e-8).log()).sum(dim=-1, keepdim=True)
-            quality = torch.cat([confidence, entropy], dim=-1)
-            invariant_features = self._build_global_invariants(
-                candidates=candidates,
-                weights=cand_weights,
-                cand_identity=cand_identity,
-                cand_similarity=cand_similarity,
-                consensus=consensus,
-                coords=coords,
-                mask=mask,
-            )
-
-        hidden = (
-            self.residue_emb(residue_idx)
-            + self.chain_emb(chain_idx)
-            + self.copy_emb(copy_idx)
-            + self.resid_proj(resid.unsqueeze(-1))
-            + self.coord_proj(consensus)
-            + self.quality_proj(quality)
+        (
+            c,
+            chunk_mask,
+            chunk_start,
+            chunk_window_valid,
+            chunk_valid,
+            chunk_identity,
+            chunk_similarity,
+            chunk_conf,
+            chunk_source,
+            chunk_residue,
+        ) = self._prepare_chunk_inputs(
+            coords=coords,
+            mask=mask,
+            residue_idx=rid,
+            template_chunk_coords=template_chunk_coords,
+            template_chunk_mask=template_chunk_mask,
+            template_chunk_start=template_chunk_start,
+            template_chunk_window_valid=template_chunk_window_valid,
+            template_chunk_valid=template_chunk_valid,
+            template_chunk_identity=template_chunk_identity,
+            template_chunk_similarity=template_chunk_similarity,
+            template_chunk_confidence=template_chunk_confidence,
+            template_chunk_source_onehot=template_chunk_source_onehot,
+            template_chunk_residue_idx=template_chunk_residue_idx,
         )
-        hidden = self.hidden_norm(hidden)
-        hidden = hidden * mask.unsqueeze(-1).float()
-        hidden = self._apply_invariant_gru(hidden, invariant_features, mask)
 
-        refined = consensus
-        for layer in self.egnn_layers:
-            hidden, refined = layer(hidden, refined, mask)
-            hidden = hidden * mask.unsqueeze(-1).float()
-            refined = refined * mask.unsqueeze(-1).float()
+        b, w, k, clen, _ = c.shape
+        pos_ids = torch.arange(clen, device=coords.device, dtype=torch.long).clamp(max=self.template_chunk_length - 1)
+        pos_emb = self.chunk_pos_emb(pos_ids).view(1, 1, 1, clen, self.hidden_dim)
+        w_ids = torch.arange(w, device=coords.device, dtype=torch.long).clamp(max=self.template_chunk_max_windows - 1)
+        w_emb = self.window_emb(w_ids).view(1, w, 1, 1, self.hidden_dim)
 
-        for layer in self.se3_layers:
-            hidden, coord_update = layer(hidden, refined, mask)
-            refined = refined + coord_update
-            hidden = hidden + self.coord_proj(coord_update)
-            hidden = hidden * mask.unsqueeze(-1).float()
+        abs_idx = chunk_start.unsqueeze(-1) + torch.arange(clen, device=coords.device, dtype=torch.long).view(1, 1, clen)
+        if l > 0:
+            abs_idx_clamped = abs_idx.clamp(min=0, max=l - 1)
+            target_residue = torch.gather(rid, 1, abs_idx_clamped.view(b, -1)).view(b, w, clen)
+            target_resid = torch.gather(resid.to(dtype=coords.dtype), 1, abs_idx_clamped.view(b, -1)).view(b, w, clen)
+            target_mask = torch.gather(mask.long(), 1, abs_idx_clamped.view(b, -1)).view(b, w, clen).bool()
+        else:
+            target_residue = torch.zeros(b, w, clen, device=coords.device, dtype=torch.long)
+            target_resid = torch.zeros(b, w, clen, device=coords.device, dtype=coords.dtype)
+            target_mask = torch.zeros(b, w, clen, device=coords.device, dtype=torch.bool)
+        valid_token = chunk_mask & chunk_window_valid.unsqueeze(-1) & (abs_idx < l) & target_mask
 
-        return refined
+        target_token = (
+            self.residue_emb(target_residue.clamp(min=0, max=self.residue_emb.num_embeddings - 1))
+            + self.resid_proj(target_resid.unsqueeze(-1))
+            + self.chunk_pos_emb(pos_ids).view(1, 1, clen, self.hidden_dim)
+        )
+        candidate_residue = self.chunk_residue_emb(
+            chunk_residue.clamp(min=0, max=self.chunk_residue_emb.num_embeddings - 1)
+        )
+        meta = torch.stack(
+            [
+                (chunk_identity / 100.0).clamp(min=0.0, max=2.0),
+                chunk_similarity.clamp(min=0.0, max=2.0),
+                chunk_conf.clamp(min=0.0, max=1.5),
+                chunk_source[..., 0].clamp(min=0.0, max=1.0),
+                chunk_source[..., 1].clamp(min=0.0, max=1.0),
+                chunk_valid.float(),
+            ],
+            dim=-1,
+        )
+        candidate_token = (
+            self.chunk_coord_proj(c)
+            + candidate_residue
+            + target_token.unsqueeze(2)
+            + pos_emb
+            + w_emb
+            + self.match_meta_proj(meta).unsqueeze(-2)
+        )
+
+        cand_token_valid = chunk_valid.unsqueeze(-1) & valid_token.unsqueeze(2)  # (B, W, K, C)
+        cand_token_valid_c = cand_token_valid.permute(0, 1, 3, 2)  # (B, W, C, K)
+        candidate_token_c = candidate_token.permute(0, 1, 3, 2, 4)  # (B, W, C, K, H)
+
+        score_tokens = torch.cat([target_token.unsqueeze(3), candidate_token_c], dim=3)  # (B, W, C, K+1, H)
+        role_ids = torch.arange(k + 1, device=coords.device, dtype=torch.long).clamp(
+            max=self.score_role_emb.num_embeddings - 1
+        )
+        score_tokens = self.score_norm(score_tokens + self.score_role_emb(role_ids).view(1, 1, 1, k + 1, self.hidden_dim))
+        score_mask = torch.cat([valid_token.unsqueeze(-1), cand_token_valid_c], dim=-1)  # (B, W, C, K+1)
+
+        flat_tokens = score_tokens.reshape(b * w * clen, k + 1, self.hidden_dim)
+        flat_mask = score_mask.reshape(b * w * clen, k + 1)
+        empty_rows = ~flat_mask.any(dim=1)
+        if bool(empty_rows.any().item()):
+            flat_tokens = flat_tokens.clone()
+            flat_mask = flat_mask.clone()
+            flat_tokens[empty_rows, 0] = 0.0
+            flat_mask[empty_rows, 0] = True
+        encoded_tokens = self.score_transformer(flat_tokens, src_key_padding_mask=~flat_mask)
+        encoded_tokens = encoded_tokens.view(b, w, clen, k + 1, self.hidden_dim)
+
+        token_logits = self.token_score_head(encoded_tokens[:, :, :, 1:, :]).squeeze(-1)
+        token_scores = self._normalize_candidate_probs(token_logits, cand_token_valid_c)
+
+        encoded_ref = encoded_tokens[:, :, :, 0, :]  # (B, W, C, H)
+        encoded_cand = encoded_tokens[:, :, :, 1:, :].permute(0, 1, 3, 2, 4)  # (B, W, K, C, H)
+        token_weight = valid_token.float()
+        token_count = token_weight.sum(dim=2, keepdim=True).clamp(min=1.0)
+        ref_summary = (encoded_ref * token_weight.unsqueeze(-1)).sum(dim=2) / token_count
+        cand_summary = (
+            encoded_cand * token_weight.unsqueeze(2).unsqueeze(-1)
+        ).sum(dim=3) / token_count.unsqueeze(2)
+
+        window_tokens = torch.cat([ref_summary.unsqueeze(2), cand_summary], dim=2)  # (B, W, K+1, H)
+        window_tokens = self.score_norm(window_tokens + self.score_role_emb(role_ids).view(1, 1, k + 1, self.hidden_dim))
+        window_valid = chunk_valid & chunk_window_valid.unsqueeze(-1)
+        window_token_mask = torch.cat([chunk_window_valid.unsqueeze(-1), window_valid], dim=2)
+
+        flat_w_tokens = window_tokens.reshape(b * w, k + 1, self.hidden_dim)
+        flat_w_mask = window_token_mask.reshape(b * w, k + 1)
+        empty_w = ~flat_w_mask.any(dim=1)
+        if bool(empty_w.any().item()):
+            flat_w_tokens = flat_w_tokens.clone()
+            flat_w_mask = flat_w_mask.clone()
+            flat_w_tokens[empty_w, 0] = 0.0
+            flat_w_mask[empty_w, 0] = True
+        encoded_windows = self.score_transformer(flat_w_tokens, src_key_padding_mask=~flat_w_mask)
+        encoded_windows = encoded_windows.view(b, w, k + 1, self.hidden_dim)
+
+        window_logits = self.window_score_head(encoded_windows[:, :, 1:, :]).squeeze(-1)
+        window_scores = self._normalize_candidate_probs(window_logits, window_valid)
+
+        combined_scores = token_scores * window_scores.unsqueeze(2)
+        combined_scores = self._normalize_candidate_probs(
+            logits=torch.log(combined_scores.clamp(min=1e-8)),
+            valid=cand_token_valid_c,
+        )
+
+        candidate_coords_c = c.permute(0, 1, 3, 2, 4)  # (B, W, C, K, 3)
+        window_pred = (combined_scores.unsqueeze(-1) * candidate_coords_c).sum(dim=3)  # (B, W, C, 3)
+        token_conf = combined_scores.max(dim=-1).values  # (B, W, C)
+
+        seam_base = F.softplus(self.seam_logits[:clen]) + 1e-3
+        if clen > 1:
+            axis = torch.linspace(-1.0, 1.0, steps=clen, device=coords.device, dtype=coords.dtype)
+            center = 1.0 - axis.abs()
+            center = 0.5 + 0.5 * center
+        else:
+            center = torch.ones((1,), device=coords.device, dtype=coords.dtype)
+        seam_weights = seam_base * center
+
+        aligned_window_pred = window_pred.clone()
+        stitched_sum = torch.zeros(b, l, 3, device=coords.device, dtype=coords.dtype)
+        stitched_w = torch.zeros(b, l, device=coords.device, dtype=coords.dtype)
+        stitched_conf_sum = torch.zeros(b, l, device=coords.device, dtype=coords.dtype)
+        for bi in range(b):
+            active_windows = torch.nonzero(chunk_window_valid[bi], as_tuple=False).squeeze(-1)
+            if int(active_windows.numel()) > 1:
+                active_windows = active_windows[torch.argsort(chunk_start[bi, active_windows])]
+            for wi_t in active_windows:
+                wi = int(wi_t.item())
+                if not bool(chunk_window_valid[bi, wi].item()):
+                    continue
+                token_idx = torch.nonzero(valid_token[bi, wi], as_tuple=False).squeeze(-1)
+                if int(token_idx.numel()) <= 0:
+                    continue
+                abs_pos = abs_idx[bi, wi, token_idx]
+                in_bounds = (abs_pos >= 0) & (abs_pos < l)
+                if not bool(in_bounds.any().item()):
+                    continue
+                token_idx = token_idx[in_bounds]
+                abs_pos = abs_pos[in_bounds]
+                seg_coords = window_pred[bi, wi, token_idx]
+                seg_conf = token_conf[bi, wi, token_idx]
+                seam_score = seam_weights[token_idx] * (0.5 + 0.5 * seg_conf).clamp(min=1e-3)
+
+                overlap_mask = stitched_w[bi, abs_pos] > 0.0
+                if int(overlap_mask.sum().item()) >= 3:
+                    src_ov = seg_coords[overlap_mask]
+                    ref_ov = stitched_sum[bi, abs_pos[overlap_mask]] / stitched_w[bi, abs_pos[overlap_mask]].unsqueeze(
+                        -1
+                    ).clamp(min=1e-6)
+                    ov_w = seam_score[overlap_mask] * stitched_w[bi, abs_pos[overlap_mask]].clamp(min=1e-6)
+                    r, t = self._weighted_kabsch_transform(source=src_ov, target=ref_ov, weights=ov_w)
+                    seg_coords = seg_coords @ r.transpose(0, 1) + t
+
+                aligned_window_pred[bi, wi, token_idx] = seg_coords
+                stitched_sum[bi].index_add_(0, abs_pos, seg_coords * seam_score.unsqueeze(-1))
+                stitched_w[bi].index_add_(0, abs_pos, seam_score)
+                stitched_conf_sum[bi].index_add_(0, abs_pos, seg_conf * seam_score)
+
+        stitched_coords = torch.where(
+            stitched_w.unsqueeze(-1) > 0.0,
+            stitched_sum / stitched_w.unsqueeze(-1).clamp(min=1e-6),
+            coords,
+        )
+        stitched_conf = torch.where(
+            stitched_w > 0.0,
+            stitched_conf_sum / stitched_w.clamp(min=1e-6),
+            torch.zeros_like(stitched_conf_sum),
+        )
+        stitched_coords = stitched_coords * mask.unsqueeze(-1).float()
+        stitched_conf = stitched_conf * mask.float()
+
+        if w > 1 and clen > self.template_chunk_stride:
+            ov = clen - self.template_chunk_stride
+            left_ok = valid_token[:, :-1, clen - ov : clen]
+            right_ok = valid_token[:, 1:, :ov]
+            ov_valid = left_ok & right_ok
+            left_xyz = aligned_window_pred[:, :-1, clen - ov : clen]
+            right_xyz = aligned_window_pred[:, 1:, :ov]
+            ov_gap = torch.linalg.norm(left_xyz - right_xyz, dim=-1)
+            compat = (torch.exp(-0.25 * ov_gap) * ov_valid.float()).sum(dim=-1) / ov_valid.float().sum(dim=-1).clamp(
+                min=1.0
+            )
+            self.last_overlap_compatibility = compat.detach()
+        else:
+            self.last_overlap_compatibility = torch.zeros(
+                b,
+                max(0, w - 1),
+                device=coords.device,
+                dtype=coords.dtype,
+            )
+
+        hidden = seq_embed + self.coord_context_proj(stitched_coords) + self.conf_context_proj(
+            stitched_conf.unsqueeze(-1)
+        )
+        safe_hidden = hidden
+        safe_mask = mask
+        empty_seq = ~safe_mask.any(dim=1)
+        if bool(empty_seq.any().item()):
+            safe_hidden = safe_hidden.clone()
+            safe_mask = safe_mask.clone()
+            safe_hidden[empty_seq, 0] = 0.0
+            safe_mask[empty_seq, 0] = True
+        h = safe_hidden
+        if self.refinement_block == "transformer":
+            for layer in self.global_layers:
+                h = layer(h, src_key_padding_mask=~safe_mask)
+                h = h * safe_mask.unsqueeze(-1).float()
+            assert self.coord_delta_head is not None
+            pred = (stitched_coords + self.coord_delta_head(self.refine_norm(h))) * mask.unsqueeze(-1).float()
+        else:
+            pred = stitched_coords
+            for layer in self.se3_layers:
+                h, delta = layer(h, pred, mask)
+                pred = (pred + delta) * mask.unsqueeze(-1).float()
+                assert self.coord_to_hidden is not None
+                h = (h + self.coord_to_hidden(delta)) * mask.unsqueeze(-1).float()
+
+        model_conf = torch.sigmoid(self.conf_out(self.refine_norm(h))).squeeze(-1)
+        self.last_confidence = (0.5 * model_conf + 0.5 * stitched_conf) * mask.float()
+        self.last_token_candidate_scores = combined_scores.detach()
+        self.last_window_candidate_scores = window_scores.detach()
+
+        self.last_aux_losses = self._compute_geom_aux(pred, mask) if self.use_geom_aux else {}
+        return pred
 
 
 if __name__ == "__main__":

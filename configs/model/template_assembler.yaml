@@ -19,26 +19,34 @@ net:
   _target_: src.models.template_assembler.TemplateSegmentAssembler
   hidden_dim: 256
   num_candidates: 5
-  segment_length: 64
-  segment_stride: 32
   residue_vocab_size: 5
   max_chain_embeddings: 64
   max_copy_embeddings: 64
-  egnn_layers: 1
-  egnn_seq_radius: 2
-  egnn_knn: 16
-  egnn_coord_step_size: 0.1
-  se3_refine_layers: 2
+  template_chunk_length: 512
+  template_chunk_stride: 256
+  template_chunk_max_windows: 64
+  seq_transformer_layers: 4
+  seq_transformer_heads: 8
+  sparse_block_size: 64
+  sparse_window: 256
+  sparse_global_stride: 128
+  sparse_max_global_tokens: 64
+  transformer_dropout: 0.0
+  cross_attention_heads: 8
+  refinement_block: se3
+  se3_refine_layers: 4
   se3_num_heads: 4
   se3_dropout: 0.0
   se3_coord_step_size: 0.1
-  template_chunk_length: 512
-  template_chunk_stride: 256
-  template_chunk_max_windows: 20
-  hybrid_gru_layers: 2
-  hybrid_gru_dropout: 0.0
+  geometric_constraints_enabled: false
+  geometric_constraints_passes: 3
+  geometric_constraints_strength: 0.75
+  geometric_constraints_nonlocal_max_points: 160
+  geometric_constraints_nonlocal_min_sep: 2
+  geometric_constraints_repulsion_temp: 0.25
 
 compile: false
+loss_mode: one_minus_tm
 use_permutation_aware_metric: true
 must_be_better_weight: 0.5
 must_be_better_margin: 0.01

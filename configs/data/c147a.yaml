@@ -1,8 +1,8 @@
 _target_: src.data.c147a_datamodule.C147ADataModule
 data_dir: ${paths.data_dir}
 labels_file: train_labels.csv
-batch_size: 4
-num_workers: 8
+batch_size: 1
+num_workers: 4
 pin_memory: False
 persistent_workers: True
 train_fraction: 0.95
@@ -19,11 +19,14 @@ template_file: template_coords.pt
 precompute_templates_if_missing: true
 template_precompute_num_threads: 22
 template_min_percent_identity: 50.0
-template_min_similarity: 0.1
+template_min_similarity: 0.0
 template_max_templates: 8
 template_topk_count: 5
 template_chunk_length: 512
 template_chunk_stride: 256
-template_chunk_max_windows: 20
+template_chunk_max_windows: 64
+template_protenix_fallback_zip: protenix_finished_chunks_full_4gpu_2775chunks_20260309T215807Z
+template_protenix_base_confidence: 0.85
+template_force_oracle_only: false
 template_length_ratio_tolerance: 0.3
 seed: 42

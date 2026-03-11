@@ -23,6 +23,30 @@ DEFAULT_EFFECTIVE_SPRING_CONSTANT_N_PER_M = 2.0
 log = logging.getLogger(__name__)
 
 
+def _compute_chunk_starts(seq_len: int, chunk_length: int, chunk_stride: int, max_windows: int) -> list[int]:
+    length = max(1, int(chunk_length))
+    stride = max(1, int(chunk_stride))
+    max_w = max(1, int(max_windows))
+    if seq_len <= 0:
+        return []
+
+    starts: list[int] = []
+    start = 0
+    while start < seq_len and len(starts) < max_w:
+        starts.append(start)
+        if start + length >= seq_len:
+            break
+        start += stride
+
+    last_start = max(0, seq_len - length)
+    if last_start not in starts:
+        if len(starts) < max_w:
+            starts.append(last_start)
+        elif starts:
+            starts[-1] = last_start
+    return sorted(set(starts))[:max_w]
+
+
 @dataclass
 class RNAExample:
     target_id: str
@@ -36,6 +60,7 @@ class RNAExample:
     template_topk_valid: torch.Tensor  # (K,)
     template_topk_identity: torch.Tensor  # (K,)
     template_topk_similarity: torch.Tensor  # (K,)
+    template_topk_residue_idx: torch.Tensor  # (K, L)
     template_chunk_coords: torch.Tensor  # (W, K, C, 3)
     template_chunk_mask: torch.Tensor  # (W, C)
     template_chunk_start: torch.Tensor  # (W,)
@@ -43,6 +68,9 @@ class RNAExample:
     template_chunk_valid: torch.Tensor  # (W, K)
     template_chunk_identity: torch.Tensor  # (W, K)
     template_chunk_similarity: torch.Tensor  # (W, K)
+    template_chunk_confidence: torch.Tensor  # (W, K)
+    template_chunk_source_onehot: torch.Tensor  # (W, K, 2)
+    template_chunk_residue_idx: torch.Tensor  # (W, K, C)
     has_template: bool
 
 
@@ -61,11 +89,16 @@ class RNAIdentityDataset(Dataset[RNAExample]):
         template_chunk_valid_by_target: Optional[dict[str, torch.Tensor]] = None,
         template_chunk_identity_by_target: Optional[dict[str, torch.Tensor]] = None,
         template_chunk_similarity_by_target: Optional[dict[str, torch.Tensor]] = None,
+        template_chunk_confidence_by_target: Optional[dict[str, torch.Tensor]] = None,
+        template_chunk_source_onehot_by_target: Optional[dict[str, torch.Tensor]] = None,
+        template_chunk_residue_idx_by_target: Optional[dict[str, torch.Tensor]] = None,
         template_topk_count: int = 5,
         template_chunk_length: int = 512,
-        template_chunk_max_windows: int = 20,
+        template_chunk_stride: int = 256,
+        template_chunk_max_windows: int = 64,
         template_min_percent_identity: float = 50.0,
         enforce_template_coverage: bool = True,
+        template_force_oracle_only: bool = False,
     ) -> None:
         self.labels_path = Path(labels_path)
         self.max_residues_per_target = max_residues_per_target
@@ -79,11 +112,16 @@ class RNAIdentityDataset(Dataset[RNAExample]):
         self.template_chunk_valid_by_target = template_chunk_valid_by_target or {}
         self.template_chunk_identity_by_target = template_chunk_identity_by_target or {}
         self.template_chunk_similarity_by_target = template_chunk_similarity_by_target or {}
+        self.template_chunk_confidence_by_target = template_chunk_confidence_by_target or {}
+        self.template_chunk_source_onehot_by_target = template_chunk_source_onehot_by_target or {}
+        self.template_chunk_residue_idx_by_target = template_chunk_residue_idx_by_target or {}
         self.template_topk_count = max(1, int(template_topk_count))
         self.template_chunk_length = max(1, int(template_chunk_length))
+        self.template_chunk_stride = max(1, int(template_chunk_stride))
         self.template_chunk_max_windows = max(1, int(template_chunk_max_windows))
         self.template_min_percent_identity = float(template_min_percent_identity)
         self.enforce_template_coverage = bool(enforce_template_coverage)
+        self.template_force_oracle_only = bool(template_force_oracle_only)
         self.examples, self.num_chain_types, self.max_copy_number, self.num_examples_with_template = self._load_examples()
 
     def _load_examples(self) -> tuple[list[RNAExample], int, int, int]:
@@ -138,6 +176,7 @@ class RNAIdentityDataset(Dataset[RNAExample]):
             copies = [max(0, r[5]) for r in rows]
             resids = [r[3] for r in rows]
             coords = [[r[6], r[7], r[8]] for r in rows]
+            residue_idx_t = torch.tensor(residues, dtype=torch.long)
 
             resid_t = torch.tensor(resids, dtype=torch.float32)
             denom = resid_t.max().clamp(min=1.0)
@@ -149,6 +188,11 @@ class RNAIdentityDataset(Dataset[RNAExample]):
             template_topk_valid = torch.zeros((self.template_topk_count,), dtype=torch.bool)
             template_topk_identity = torch.zeros((self.template_topk_count,), dtype=torch.float32)
             template_topk_similarity = torch.zeros((self.template_topk_count,), dtype=torch.float32)
+            template_topk_residue_idx = torch.full(
+                (self.template_topk_count, coords_t.shape[0]),
+                4,
+                dtype=torch.long,
+            )
             template_chunk_coords = torch.zeros(
                 (self.template_chunk_max_windows, self.template_topk_count, self.template_chunk_length, 3),
                 dtype=torch.float32,
@@ -167,6 +211,19 @@ class RNAIdentityDataset(Dataset[RNAExample]):
             template_chunk_similarity = torch.zeros(
                 (self.template_chunk_max_windows, self.template_topk_count),
                 dtype=torch.float32,
+            )
+            template_chunk_confidence = torch.zeros(
+                (self.template_chunk_max_windows, self.template_topk_count),
+                dtype=torch.float32,
+            )
+            template_chunk_source_onehot = torch.zeros(
+                (self.template_chunk_max_windows, self.template_topk_count, 2),
+                dtype=torch.float32,
+            )
+            template_chunk_residue_idx = torch.full(
+                (self.template_chunk_max_windows, self.template_topk_count, self.template_chunk_length),
+                4,
+                dtype=torch.long,
             )
             has_template = False
             if target_id in self.template_coords_by_target:
@@ -235,6 +292,83 @@ class RNAIdentityDataset(Dataset[RNAExample]):
                         k_take = min(self.template_topk_count, int(chunk_similarity_t.shape[1]))
                         template_chunk_similarity[:w_take, :k_take] = chunk_similarity_t[:w_take, :k_take]
 
+                chunk_confidence_raw = self.template_chunk_confidence_by_target.get(target_id, None)
+                if isinstance(chunk_confidence_raw, torch.Tensor) and chunk_confidence_raw.numel() > 0:
+                    chunk_confidence_t = chunk_confidence_raw.detach().to(dtype=torch.float32, device="cpu")
+                    if chunk_confidence_t.ndim == 2:
+                        w_take = min(self.template_chunk_max_windows, int(chunk_confidence_t.shape[0]))
+                        k_take = min(self.template_topk_count, int(chunk_confidence_t.shape[1]))
+                        template_chunk_confidence[:w_take, :k_take] = chunk_confidence_t[:w_take, :k_take]
+
+                chunk_source_onehot_raw = self.template_chunk_source_onehot_by_target.get(target_id, None)
+                if isinstance(chunk_source_onehot_raw, torch.Tensor) and chunk_source_onehot_raw.numel() > 0:
+                    chunk_source_onehot_t = chunk_source_onehot_raw.detach().to(dtype=torch.float32, device="cpu")
+                    if chunk_source_onehot_t.ndim == 3 and int(chunk_source_onehot_t.shape[-1]) == 2:
+                        w_take = min(self.template_chunk_max_windows, int(chunk_source_onehot_t.shape[0]))
+                        k_take = min(self.template_topk_count, int(chunk_source_onehot_t.shape[1]))
+                        template_chunk_source_onehot[:w_take, :k_take] = chunk_source_onehot_t[:w_take, :k_take]
+
+                chunk_residue_idx_raw = self.template_chunk_residue_idx_by_target.get(target_id, None)
+                if isinstance(chunk_residue_idx_raw, torch.Tensor) and chunk_residue_idx_raw.numel() > 0:
+                    chunk_residue_idx_t = chunk_residue_idx_raw.detach().to(dtype=torch.long, device="cpu")
+                    if chunk_residue_idx_t.ndim == 3:
+                        w_take = min(self.template_chunk_max_windows, int(chunk_residue_idx_t.shape[0]))
+                        k_take = min(self.template_topk_count, int(chunk_residue_idx_t.shape[1]))
+                        c_take = min(self.template_chunk_length, int(chunk_residue_idx_t.shape[2]))
+                        template_chunk_residue_idx[:w_take, :k_take, :c_take] = chunk_residue_idx_t[
+                            :w_take, :k_take, :c_take
+                        ]
+
+            if self.template_force_oracle_only:
+                seq_len = int(coords_t.shape[0])
+                starts = _compute_chunk_starts(
+                    seq_len=seq_len,
+                    chunk_length=self.template_chunk_length,
+                    chunk_stride=self.template_chunk_stride,
+                    max_windows=self.template_chunk_max_windows,
+                )
+                k_count = int(self.template_topk_count)
+                c_len = int(self.template_chunk_length)
+
+                template_coords = coords_t.clone()
+                template_topk_coords = coords_t.unsqueeze(0).repeat(k_count, 1, 1)
+                template_topk_valid = torch.ones((k_count,), dtype=torch.bool)
+                template_topk_identity = torch.full((k_count,), 100.0, dtype=torch.float32)
+                template_topk_similarity = torch.full((k_count,), 1.0, dtype=torch.float32)
+                template_topk_residue_idx = residue_idx_t.unsqueeze(0).repeat(k_count, 1)
+
+                template_chunk_coords.zero_()
+                template_chunk_mask.zero_()
+                template_chunk_start.zero_()
+                template_chunk_window_valid.zero_()
+                template_chunk_valid.zero_()
+                template_chunk_identity.zero_()
+                template_chunk_similarity.zero_()
+                template_chunk_confidence.zero_()
+                template_chunk_source_onehot.zero_()
+                template_chunk_residue_idx.fill_(4)
+
+                for w_idx, start_idx in enumerate(starts):
+                    if w_idx >= self.template_chunk_max_windows:
+                        break
+                    end_idx = min(seq_len, int(start_idx) + c_len)
+                    seg_len = max(0, end_idx - int(start_idx))
+                    if seg_len <= 0:
+                        continue
+                    template_chunk_start[w_idx] = int(start_idx)
+                    template_chunk_window_valid[w_idx] = True
+                    template_chunk_mask[w_idx, :seg_len] = True
+                    for k_idx in range(k_count):
+                        template_chunk_coords[w_idx, k_idx, :seg_len] = coords_t[int(start_idx) : end_idx]
+                        template_chunk_valid[w_idx, k_idx] = True
+                        template_chunk_identity[w_idx, k_idx] = 100.0
+                        template_chunk_similarity[w_idx, k_idx] = 1.0
+                        template_chunk_confidence[w_idx, k_idx] = 0.0
+                        template_chunk_source_onehot[w_idx, k_idx, 0] = 1.0
+                        template_chunk_source_onehot[w_idx, k_idx, 1] = 0.0
+                        template_chunk_residue_idx[w_idx, k_idx, :seg_len] = residue_idx_t[int(start_idx) : end_idx]
+                has_template = True
+
             if self.enforce_template_coverage:
                 active_windows = torch.nonzero(template_chunk_window_valid, as_tuple=False).squeeze(-1)
                 for w_idx_t in active_windows:
@@ -248,6 +382,9 @@ class RNAIdentityDataset(Dataset[RNAExample]):
                         fill_coords = template_chunk_coords[w_idx, best_idx].clone()
                         fill_identity = float(template_chunk_identity[w_idx, best_idx].item())
                         fill_similarity = float(template_chunk_similarity[w_idx, best_idx].item())
+                        fill_confidence = float(template_chunk_confidence[w_idx, best_idx].item())
+                        fill_source_onehot = template_chunk_source_onehot[w_idx, best_idx].clone()
+                        fill_residue_idx = template_chunk_residue_idx[w_idx, best_idx].clone()
                         for k_idx in range(self.template_topk_count):
                             if qualified_count >= self.template_topk_count:
                                 break
@@ -257,6 +394,9 @@ class RNAIdentityDataset(Dataset[RNAExample]):
                             template_chunk_valid[w_idx, k_idx] = True
                             template_chunk_identity[w_idx, k_idx] = fill_identity
                             template_chunk_similarity[w_idx, k_idx] = fill_similarity
+                            template_chunk_confidence[w_idx, k_idx] = fill_confidence
+                            template_chunk_source_onehot[w_idx, k_idx] = fill_source_onehot
+                            template_chunk_residue_idx[w_idx, k_idx] = fill_residue_idx
                             qualified[k_idx] = True
                             qualified_count += 1
 
@@ -266,6 +406,7 @@ class RNAIdentityDataset(Dataset[RNAExample]):
                 rebuilt_topk_valid,
                 rebuilt_topk_identity,
                 rebuilt_topk_similarity,
+                rebuilt_topk_residue_idx,
                 rebuilt_has_template,
             ) = _rebuild_template_views_from_chunks(
                 seq_len=int(coords_t.shape[0]),
@@ -276,6 +417,7 @@ class RNAIdentityDataset(Dataset[RNAExample]):
                 chunk_valid=template_chunk_valid,
                 chunk_identity=template_chunk_identity,
                 chunk_similarity=template_chunk_similarity,
+                chunk_residue_idx=template_chunk_residue_idx,
                 topk_count=self.template_topk_count,
             )
             template_coords = rebuilt_template_coords
@@ -283,6 +425,7 @@ class RNAIdentityDataset(Dataset[RNAExample]):
             template_topk_valid = rebuilt_topk_valid
             template_topk_identity = rebuilt_topk_identity
             template_topk_similarity = rebuilt_topk_similarity
+            template_topk_residue_idx = rebuilt_topk_residue_idx
             has_template = bool(has_template or rebuilt_has_template)
 
             if has_template:
@@ -291,7 +434,7 @@ class RNAIdentityDataset(Dataset[RNAExample]):
             examples.append(
                 RNAExample(
                     target_id=target_id,
-                    residue_idx=torch.tensor(residues, dtype=torch.long),
+                    residue_idx=residue_idx_t,
                     chain_idx=torch.tensor(chains, dtype=torch.long),
                     copy_idx=torch.tensor(copies, dtype=torch.long),
                     resid_norm=resid_norm,
@@ -301,6 +444,7 @@ class RNAIdentityDataset(Dataset[RNAExample]):
                     template_topk_valid=template_topk_valid,
                     template_topk_identity=template_topk_identity,
                     template_topk_similarity=template_topk_similarity,
+                    template_topk_residue_idx=template_topk_residue_idx,
                     template_chunk_coords=template_chunk_coords,
                     template_chunk_mask=template_chunk_mask,
                     template_chunk_start=template_chunk_start,
@@ -308,6 +452,9 @@ class RNAIdentityDataset(Dataset[RNAExample]):
                     template_chunk_valid=template_chunk_valid,
                     template_chunk_identity=template_chunk_identity,
                     template_chunk_similarity=template_chunk_similarity,
+                    template_chunk_confidence=template_chunk_confidence,
+                    template_chunk_source_onehot=template_chunk_source_onehot,
+                    template_chunk_residue_idx=template_chunk_residue_idx,
                     has_template=has_template,
                 )
             )
@@ -343,13 +490,15 @@ def _rebuild_template_views_from_chunks(
     chunk_valid: torch.Tensor,
     chunk_identity: torch.Tensor,
     chunk_similarity: torch.Tensor,
+    chunk_residue_idx: torch.Tensor,
     topk_count: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
     template_coords = torch.zeros((seq_len, 3), dtype=torch.float32)
     template_topk_coords = torch.zeros((topk_count, seq_len, 3), dtype=torch.float32)
     template_topk_valid = torch.zeros((topk_count,), dtype=torch.bool)
     template_topk_identity = torch.zeros((topk_count,), dtype=torch.float32)
     template_topk_similarity = torch.zeros((topk_count,), dtype=torch.float32)
+    template_topk_residue_idx = torch.full((topk_count, seq_len), 4, dtype=torch.long)
 
     active_windows = torch.nonzero(chunk_window_valid, as_tuple=False).squeeze(-1)
     has_template = False
@@ -396,6 +545,7 @@ def _rebuild_template_views_from_chunks(
             template_topk_identity[:k_take] = chunk_identity[w_idx, :k_take]
             template_topk_similarity[:k_take] = chunk_similarity[w_idx, :k_take]
             template_topk_coords[:k_take, start_idx:end_idx] = chunk_coords[w_idx, :k_take, :seg_len]
+            template_topk_residue_idx[:k_take, start_idx:end_idx] = chunk_residue_idx[w_idx, :k_take, :seg_len]
 
     return (
         template_coords,
@@ -403,6 +553,7 @@ def _rebuild_template_views_from_chunks(
         template_topk_valid,
         template_topk_identity,
         template_topk_similarity,
+        template_topk_residue_idx,
         has_template,
     )
 
@@ -430,6 +581,7 @@ def _collate_rna_batch(
     template_topk_valid = torch.zeros(batch_size, topk_count, dtype=torch.bool)
     template_topk_identity = torch.zeros(batch_size, topk_count, dtype=torch.float32)
     template_topk_similarity = torch.zeros(batch_size, topk_count, dtype=torch.float32)
+    template_topk_residue_idx = torch.full((batch_size, topk_count, max_len), 4, dtype=torch.long)
     chunk_windows = batch[0].template_chunk_coords.shape[0] if batch else 1
     chunk_length = batch[0].template_chunk_coords.shape[2] if batch else 1
     template_chunk_coords = torch.zeros(
@@ -446,6 +598,13 @@ def _collate_rna_batch(
     template_chunk_valid = torch.zeros(batch_size, chunk_windows, topk_count, dtype=torch.bool)
     template_chunk_identity = torch.zeros(batch_size, chunk_windows, topk_count, dtype=torch.float32)
     template_chunk_similarity = torch.zeros(batch_size, chunk_windows, topk_count, dtype=torch.float32)
+    template_chunk_confidence = torch.zeros(batch_size, chunk_windows, topk_count, dtype=torch.float32)
+    template_chunk_source_onehot = torch.zeros(batch_size, chunk_windows, topk_count, 2, dtype=torch.float32)
+    template_chunk_residue_idx = torch.full(
+        (batch_size, chunk_windows, topk_count, chunk_length),
+        4,
+        dtype=torch.long,
+    )
 
     for i, item in enumerate(batch):
         seq_len = item.coords.shape[0]
@@ -461,6 +620,7 @@ def _collate_rna_batch(
         template_topk_valid[i] = item.template_topk_valid
         template_topk_identity[i] = item.template_topk_identity
         template_topk_similarity[i] = item.template_topk_similarity
+        template_topk_residue_idx[i, :, :seq_len] = item.template_topk_residue_idx
         template_topk_mask[i, :, :seq_len] = item.template_topk_valid.unsqueeze(-1)
         template_chunk_coords[i] = item.template_chunk_coords
         template_chunk_mask[i] = item.template_chunk_mask
@@ -469,6 +629,9 @@ def _collate_rna_batch(
         template_chunk_valid[i] = item.template_chunk_valid
         template_chunk_identity[i] = item.template_chunk_identity
         template_chunk_similarity[i] = item.template_chunk_similarity
+        template_chunk_confidence[i] = item.template_chunk_confidence
+        template_chunk_source_onehot[i] = item.template_chunk_source_onehot
+        template_chunk_residue_idx[i] = item.template_chunk_residue_idx
 
     target_coords = coords.clone()
     if use_template_only_inputs:
@@ -508,13 +671,17 @@ def _collate_rna_batch(
         "template_topk_valid": template_topk_valid,  # top-K availability mask per template
         "template_topk_identity": template_topk_identity,  # top-K template percent identity
         "template_topk_similarity": template_topk_similarity,  # top-K template normalized similarity
-        "template_chunk_coords": template_chunk_coords,  # up to 20x5 chunk candidates
+        "template_topk_residue_idx": template_topk_residue_idx,  # top-K template residue ids
+        "template_chunk_coords": template_chunk_coords,  # up to W x K chunk candidates
         "template_chunk_mask": template_chunk_mask,  # valid tokens per chunk window
         "template_chunk_start": template_chunk_start,  # start index of each chunk window
         "template_chunk_window_valid": template_chunk_window_valid,  # valid chunk windows
         "template_chunk_valid": template_chunk_valid,  # valid candidates per chunk window
         "template_chunk_identity": template_chunk_identity,  # candidate identity per chunk window
         "template_chunk_similarity": template_chunk_similarity,  # candidate similarity per chunk window
+        "template_chunk_confidence": template_chunk_confidence,  # candidate confidence per chunk window (Protenix)
+        "template_chunk_source_onehot": template_chunk_source_onehot,  # [is_template, is_protenix] per candidate
+        "template_chunk_residue_idx": template_chunk_residue_idx,  # candidate template residue ids per chunk
         "target_coords": target_coords,  # clean target coordinates
         "mask": mask,
     }
@@ -544,13 +711,16 @@ class C147ADataModule(LightningDataModule):
         template_file: str = "template_coords.pt",
         precompute_templates_if_missing: bool = True,
         template_min_percent_identity: float = 50.0,
-        template_min_similarity: float = 0.1,
+        template_min_similarity: float = 0.0,
         template_max_templates: int = 8,
         template_length_ratio_tolerance: float = 0.3,
         template_topk_count: int = 5,
         template_chunk_length: int = 512,
         template_chunk_stride: int = 256,
-        template_chunk_max_windows: int = 20,
+        template_chunk_max_windows: int = 64,
+        template_protenix_fallback_zip: str = "protenix_finished_chunks_full_4gpu_2775chunks_20260309T215807Z",
+        template_protenix_base_confidence: float = 0.85,
+        template_force_oracle_only: bool = False,
         template_precompute_num_threads: int = 0,
         seed: int = 42,
     ) -> None:
@@ -572,6 +742,11 @@ class C147ADataModule(LightningDataModule):
             raise FileNotFoundError(f"Expected labels file at: {labels_path}")
 
         if self.hparams.use_template_coords:
+            if bool(self.hparams.template_force_oracle_only):
+                log.warning(
+                    "template_force_oracle_only=True: skipping template precompute and using target-derived oracle templates for all candidates."
+                )
+                return
             template_path = Path(self.hparams.data_dir) / self.hparams.template_file
             should_precompute = (not template_path.exists()) and self.hparams.precompute_templates_if_missing
 
@@ -589,7 +764,11 @@ class C147ADataModule(LightningDataModule):
                         and "chunk_topk_valid" in payload
                         and "chunk_topk_identity" in payload
                         and "chunk_topk_similarity" in payload
+                        and "chunk_topk_confidence" in payload
+                        and "chunk_topk_source_onehot" in payload
+                        and "chunk_topk_residue_idx" in payload
                         and "chunk_topk_sources" in payload
+                        and "protenix_chunks_used" in payload
                     )
                     topk_store = 0
                     stored_chunk_policy = ""
@@ -601,6 +780,7 @@ class C147ADataModule(LightningDataModule):
                     stored_chunk_length = 0
                     stored_chunk_stride = 0
                     stored_chunk_max_windows = 0
+                    stored_search_strategy = ""
                     if isinstance(payload, dict):
                         meta = payload.get("meta", {})
                         if isinstance(meta, dict):
@@ -615,10 +795,17 @@ class C147ADataModule(LightningDataModule):
                             stored_chunk_length = int(meta.get("chunk_length", 0))
                             stored_chunk_stride = int(meta.get("chunk_stride", 0))
                             stored_chunk_max_windows = int(meta.get("chunk_max_windows", 0))
-                    expected_chunk_policy = "chunked_topk_non_self_by_identity_similarity_no_threshold"
-                    expected_alignment_mode = "local"
+                            stored_search_strategy = str(
+                                meta.get("search_strategy", meta.get("prefilter_strategy", ""))
+                            )
+                    expected_chunk_policy = (
+                        "chunked_topk_non_self_by_similarity_rank_identity_gate_with_protenix_then_oracle_diversity_fallback"
+                    )
+                    expected_alignment_mode = "global"
+                    expected_search_strategy = "full_exhaustive_alignment"
                     needs_chunk_policy_upgrade = stored_chunk_policy != expected_chunk_policy
                     needs_alignment_upgrade = stored_alignment_mode != expected_alignment_mode
+                    needs_search_upgrade = stored_search_strategy != expected_search_strategy
                     desired_max_targets = self.hparams.max_targets
                     target_coverage_insufficient = (
                         (desired_max_targets is None and stored_max_targets is not None)
@@ -639,6 +826,7 @@ class C147ADataModule(LightningDataModule):
                         or topk_store < int(self.hparams.template_topk_count)
                         or needs_chunk_policy_upgrade
                         or needs_alignment_upgrade
+                        or needs_search_upgrade
                         or stored_allow_self_fallback
                         or (not stored_exclude_self)
                         or target_coverage_insufficient
@@ -651,6 +839,7 @@ class C147ADataModule(LightningDataModule):
                             "(need_topk=%d, found_topk=%d, "
                             "need_chunk_policy=%s, found_chunk_policy=%s, "
                             "need_alignment=%s, found_alignment=%s, "
+                            "need_search=%s, found_search=%s, "
                             "need_max_targets=%s, found_max_targets=%s, need_max_residues=%d, found_max_residues=%d, "
                             "need_chunk=(%d,%d,%d), found_chunk=(%d,%d,%d), "
                             "allow_self_fallback=%s, exclude_self=%s). "
@@ -662,6 +851,8 @@ class C147ADataModule(LightningDataModule):
                             stored_chunk_policy,
                             expected_alignment_mode,
                             stored_alignment_mode,
+                            expected_search_strategy,
+                            stored_search_strategy,
                             str(desired_max_targets),
                             str(stored_max_targets),
                             int(self.hparams.max_residues_per_target),
@@ -695,6 +886,10 @@ class C147ADataModule(LightningDataModule):
                     chunk_length=self.hparams.template_chunk_length,
                     chunk_stride=self.hparams.template_chunk_stride,
                     chunk_max_windows=self.hparams.template_chunk_max_windows,
+                    min_percent_identity=self.hparams.template_min_percent_identity,
+                    min_similarity=self.hparams.template_min_similarity,
+                    protenix_fallback_zip=Path(self.hparams.data_dir) / self.hparams.template_protenix_fallback_zip,
+                    protenix_base_confidence=self.hparams.template_protenix_base_confidence,
                     num_threads=self.hparams.template_precompute_num_threads,
                 )
 
@@ -710,15 +905,20 @@ class C147ADataModule(LightningDataModule):
         dict[str, torch.Tensor],
         dict[str, torch.Tensor],
         dict[str, torch.Tensor],
+        dict[str, torch.Tensor],
+        dict[str, torch.Tensor],
+        dict[str, torch.Tensor],
         dict[str, list[list[str]]],
     ]:
         if not self.hparams.use_template_coords:
-            return {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+            return {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+        if bool(self.hparams.template_force_oracle_only):
+            return {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
 
         template_path = Path(self.hparams.data_dir) / self.hparams.template_file
         if not template_path.exists():
             log.warning("Template file not found at %s. Continuing without template coordinates.", template_path)
-            return {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+            return {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
 
         payload = torch.load(template_path, map_location="cpu", weights_only=False)
         if isinstance(payload, dict) and "templates" in payload:
@@ -731,6 +931,9 @@ class C147ADataModule(LightningDataModule):
             chunk_topk_valid = payload.get("chunk_topk_valid", {})
             chunk_topk_identity = payload.get("chunk_topk_identity", {})
             chunk_topk_similarity = payload.get("chunk_topk_similarity", {})
+            chunk_topk_confidence = payload.get("chunk_topk_confidence", {})
+            chunk_topk_source_onehot = payload.get("chunk_topk_source_onehot", {})
+            chunk_topk_residue_idx = payload.get("chunk_topk_residue_idx", {})
             chunk_topk_sources = payload.get("chunk_topk_sources", {})
             return (
                 templates,
@@ -742,11 +945,14 @@ class C147ADataModule(LightningDataModule):
                 chunk_topk_valid,
                 chunk_topk_identity,
                 chunk_topk_similarity,
+                chunk_topk_confidence,
+                chunk_topk_source_onehot,
+                chunk_topk_residue_idx,
                 chunk_topk_sources,
             )
 
         log.warning("Template file at %s has unexpected format. Continuing without templates.", template_path)
-        return {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+        return {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
 
     def _validate_split_template_coverage(self, split: Dataset, split_name: str) -> None:
         if not self.hparams.use_template_coords:
@@ -878,7 +1084,12 @@ class C147ADataModule(LightningDataModule):
                 for k_idx in range(k_count):
                     source_id = row_sources[k_idx]
                     keep = bool(example.template_chunk_valid[w_idx, k_idx].item())
-                    keep = keep and source_id != "" and source_id in allowed_source_ids and source_id != example.target_id
+                    is_protenix = str(source_id).startswith("protenix:")
+                    is_oracle = str(source_id).startswith("oracle:")
+                    if is_protenix or is_oracle:
+                        keep = keep
+                    else:
+                        keep = keep and source_id != "" and source_id in allowed_source_ids and source_id != example.target_id
                     if not keep:
                         if bool(example.template_chunk_valid[w_idx, k_idx].item()):
                             pruned_count += 1
@@ -887,7 +1098,10 @@ class C147ADataModule(LightningDataModule):
                         example.template_chunk_valid[w_idx, k_idx] = False
                         example.template_chunk_identity[w_idx, k_idx] = 0.0
                         example.template_chunk_similarity[w_idx, k_idx] = 0.0
+                        example.template_chunk_confidence[w_idx, k_idx] = 0.0
+                        example.template_chunk_source_onehot[w_idx, k_idx].zero_()
                         example.template_chunk_coords[w_idx, k_idx].zero_()
+                        example.template_chunk_residue_idx[w_idx, k_idx].fill_(4)
                         row_sources[k_idx] = ""
 
                 qualified = example.template_chunk_valid[w_idx].clone()
@@ -899,6 +1113,9 @@ class C147ADataModule(LightningDataModule):
                     fill_coords = example.template_chunk_coords[w_idx, best_idx].clone()
                     fill_identity = float(example.template_chunk_identity[w_idx, best_idx].item())
                     fill_similarity = float(example.template_chunk_similarity[w_idx, best_idx].item())
+                    fill_confidence = float(example.template_chunk_confidence[w_idx, best_idx].item())
+                    fill_source_onehot = example.template_chunk_source_onehot[w_idx, best_idx].clone()
+                    fill_residue_idx = example.template_chunk_residue_idx[w_idx, best_idx].clone()
                     fill_source = row_sources[best_idx] if best_idx < len(row_sources) else ""
                     for k_idx in range(k_count):
                         if qualified_count >= required:
@@ -909,6 +1126,9 @@ class C147ADataModule(LightningDataModule):
                         example.template_chunk_valid[w_idx, k_idx] = True
                         example.template_chunk_identity[w_idx, k_idx] = fill_identity
                         example.template_chunk_similarity[w_idx, k_idx] = fill_similarity
+                        example.template_chunk_confidence[w_idx, k_idx] = fill_confidence
+                        example.template_chunk_source_onehot[w_idx, k_idx] = fill_source_onehot
+                        example.template_chunk_residue_idx[w_idx, k_idx] = fill_residue_idx
                         row_sources[k_idx] = fill_source
                         qualified[k_idx] = True
                         qualified_count += 1
@@ -921,6 +1141,7 @@ class C147ADataModule(LightningDataModule):
                 rebuilt_topk_valid,
                 rebuilt_topk_identity,
                 rebuilt_topk_similarity,
+                rebuilt_topk_residue_idx,
                 rebuilt_has_template,
             ) = _rebuild_template_views_from_chunks(
                 seq_len=int(example.coords.shape[0]),
@@ -931,6 +1152,7 @@ class C147ADataModule(LightningDataModule):
                 chunk_valid=example.template_chunk_valid,
                 chunk_identity=example.template_chunk_identity,
                 chunk_similarity=example.template_chunk_similarity,
+                chunk_residue_idx=example.template_chunk_residue_idx,
                 topk_count=int(example.template_topk_valid.shape[0]),
             )
             example.template_coords = rebuilt_template_coords
@@ -938,6 +1160,7 @@ class C147ADataModule(LightningDataModule):
             example.template_topk_valid = rebuilt_topk_valid
             example.template_topk_identity = rebuilt_topk_identity
             example.template_topk_similarity = rebuilt_topk_similarity
+            example.template_topk_residue_idx = rebuilt_topk_residue_idx
             example.has_template = rebuilt_has_template
             chunk_sources_by_target[example.target_id] = source_windows[:w_count]
 
@@ -972,7 +1195,7 @@ class C147ADataModule(LightningDataModule):
                     if not bool(example.template_chunk_valid[w_idx, k_idx].item()):
                         continue
                     source_id = row_sources[k_idx] if k_idx < len(row_sources) else ""
-                    if source_id == example.target_id:
+                    if (not str(source_id).startswith("protenix:")) and source_id == example.target_id:
                         violations.append((example.target_id, k_idx))
                         if len(violations) >= 10:
                             break
@@ -1047,6 +1270,9 @@ class C147ADataModule(LightningDataModule):
                 template_chunk_valid_by_target,
                 template_chunk_identity_by_target,
                 template_chunk_similarity_by_target,
+                template_chunk_confidence_by_target,
+                template_chunk_source_onehot_by_target,
+                template_chunk_residue_idx_by_target,
                 template_chunk_sources_by_target,
             ) = self._load_template_payload()
             dataset = RNAIdentityDataset(
@@ -1062,10 +1288,15 @@ class C147ADataModule(LightningDataModule):
                 template_chunk_valid_by_target=template_chunk_valid_by_target,
                 template_chunk_identity_by_target=template_chunk_identity_by_target,
                 template_chunk_similarity_by_target=template_chunk_similarity_by_target,
+                template_chunk_confidence_by_target=template_chunk_confidence_by_target,
+                template_chunk_source_onehot_by_target=template_chunk_source_onehot_by_target,
+                template_chunk_residue_idx_by_target=template_chunk_residue_idx_by_target,
                 template_topk_count=self.hparams.template_topk_count,
                 template_chunk_length=self.hparams.template_chunk_length,
+                template_chunk_stride=self.hparams.template_chunk_stride,
                 template_chunk_max_windows=self.hparams.template_chunk_max_windows,
                 template_min_percent_identity=self.hparams.template_min_percent_identity,
+                template_force_oracle_only=self.hparams.template_force_oracle_only,
             )
             self.num_chain_types = dataset.num_chain_types
             self.max_copy_number = dataset.max_copy_number
@@ -1084,30 +1315,35 @@ class C147ADataModule(LightningDataModule):
             )
 
             train_ids, val_ids, test_ids = self._validate_disjoint_splits()
-            all_ids = train_ids | val_ids | test_ids
-            self._restrict_split_template_sources(
-                self.data_train,
-                "train",
-                chunk_sources_by_target=template_chunk_sources_by_target,
-                allowed_source_ids=train_ids,
-            )
-            self._validate_no_self_template_sources(
-                self.data_train,
-                "train",
-                chunk_sources_by_target=template_chunk_sources_by_target,
-            )
-            self._restrict_split_template_sources(
-                self.data_val,
-                "val",
-                chunk_sources_by_target=template_chunk_sources_by_target,
-                allowed_source_ids=all_ids,
-            )
-            self._restrict_split_template_sources(
-                self.data_test,
-                "test",
-                chunk_sources_by_target=template_chunk_sources_by_target,
-                allowed_source_ids=all_ids,
-            )
+            if bool(self.hparams.template_force_oracle_only):
+                log.warning(
+                    "Oracle-only diagnostic mode enabled: bypassing split template-source restriction and self-source leakage checks."
+                )
+            else:
+                all_ids = train_ids | val_ids | test_ids
+                self._restrict_split_template_sources(
+                    self.data_train,
+                    "train",
+                    chunk_sources_by_target=template_chunk_sources_by_target,
+                    allowed_source_ids=train_ids,
+                )
+                self._validate_no_self_template_sources(
+                    self.data_train,
+                    "train",
+                    chunk_sources_by_target=template_chunk_sources_by_target,
+                )
+                self._restrict_split_template_sources(
+                    self.data_val,
+                    "val",
+                    chunk_sources_by_target=template_chunk_sources_by_target,
+                    allowed_source_ids=all_ids,
+                )
+                self._restrict_split_template_sources(
+                    self.data_test,
+                    "test",
+                    chunk_sources_by_target=template_chunk_sources_by_target,
+                    allowed_source_ids=all_ids,
+                )
             self.data_train = self._filter_split_min_templates(
                 self.data_train,
                 "train",

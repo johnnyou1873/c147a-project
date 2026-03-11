@@ -24,6 +24,7 @@ class C147ALitModule(LightningModule):
         optimizer: torch.optim.Optimizer,
         scheduler: torch.optim.lr_scheduler,
         compile: bool,
+        loss_mode: str = "improvement_focused_tm",
         use_permutation_aware_metric: bool = True,
         must_be_better_weight: float = 0.5,
         must_be_better_margin: float = 0.01,
@@ -34,6 +35,12 @@ class C147ALitModule(LightningModule):
         super().__init__()
         self.save_hyperparameters(logger=False, ignore=["net"])
         self.net = net
+        self.loss_mode = str(loss_mode).strip().lower()
+        valid_loss_modes = {"one_minus_tm", "improvement_focused_tm"}
+        if self.loss_mode not in valid_loss_modes:
+            raise ValueError(
+                f"Invalid loss_mode='{loss_mode}'. Expected one of: {sorted(valid_loss_modes)}"
+            )
 
         self.train_loss = MeanMetric()
         self.val_loss = MeanMetric()
@@ -61,6 +68,7 @@ class C147ALitModule(LightningModule):
             "template_topk_valid": batch.get("template_topk_valid"),
             "template_topk_identity": batch.get("template_topk_identity"),
             "template_topk_similarity": batch.get("template_topk_similarity"),
+            "template_topk_residue_idx": batch.get("template_topk_residue_idx"),
             "template_chunk_coords": batch.get("template_chunk_coords"),
             "template_chunk_mask": batch.get("template_chunk_mask"),
             "template_chunk_start": batch.get("template_chunk_start"),
@@ -68,6 +76,9 @@ class C147ALitModule(LightningModule):
             "template_chunk_valid": batch.get("template_chunk_valid"),
             "template_chunk_identity": batch.get("template_chunk_identity"),
             "template_chunk_similarity": batch.get("template_chunk_similarity"),
+            "template_chunk_confidence": batch.get("template_chunk_confidence"),
+            "template_chunk_source_onehot": batch.get("template_chunk_source_onehot"),
+            "template_chunk_residue_idx": batch.get("template_chunk_residue_idx"),
         }
         try:
             valid_keys = set(inspect.signature(self.net.forward).parameters.keys())
@@ -261,6 +272,7 @@ class C147ALitModule(LightningModule):
         # Differentiable TM-score for optimization.
         tm_scores_train = []
         improvement_terms = []
+        use_improvement = self.loss_mode == "improvement_focused_tm"
         for b in range(pred.shape[0]):
             valid = mask[b]
             pred_b = pred[b, valid]
@@ -270,24 +282,25 @@ class C147ALitModule(LightningModule):
             tm_pred = self._tm_score(pred_b, target_b)
             tm_scores_train.append(tm_pred)
 
-            with torch.no_grad():
-                input_b = input_coords[b, valid].to(dtype=torch.float32)
-                target_b_f = target_b.to(dtype=torch.float32)
-                baseline_tm = self._tm_score(input_b, target_b_f)
+            if use_improvement:
+                with torch.no_grad():
+                    input_b = input_coords[b, valid].to(dtype=torch.float32)
+                    target_b_f = target_b.to(dtype=torch.float32)
+                    baseline_tm = self._tm_score(input_b, target_b_f)
 
-                template_mask_b = template_mask[b, valid].unsqueeze(-1)
-                if bool(template_mask_b.any()):
-                    template_passthrough_b = torch.where(
-                        template_mask_b,
-                        template_coords[b, valid].to(dtype=torch.float32),
-                        input_b,
-                    )
-                    baseline_tm = torch.maximum(baseline_tm, self._tm_score(template_passthrough_b, target_b_f))
+                    template_mask_b = template_mask[b, valid].unsqueeze(-1)
+                    if bool(template_mask_b.any()):
+                        template_passthrough_b = torch.where(
+                            template_mask_b,
+                            template_coords[b, valid].to(dtype=torch.float32),
+                            input_b,
+                        )
+                        baseline_tm = torch.maximum(baseline_tm, self._tm_score(template_passthrough_b, target_b_f))
 
-                factor = self._inverse_log_factor(baseline_tm)
-                margin = float(self.hparams.must_be_better_margin)
-                improvement_gap = torch.relu(baseline_tm + margin - tm_pred)
-                improvement_terms.append(factor.to(dtype=improvement_gap.dtype) * improvement_gap)
+                    factor = self._inverse_log_factor(baseline_tm)
+                    margin = float(self.hparams.must_be_better_margin)
+                    improvement_gap = torch.relu(baseline_tm + margin - tm_pred)
+                    improvement_terms.append(factor.to(dtype=improvement_gap.dtype) * improvement_gap)
 
         if tm_scores_train:
             tm_train = torch.stack(tm_scores_train).mean()
@@ -295,11 +308,14 @@ class C147ALitModule(LightningModule):
             tm_train = pred.new_tensor(0.0)
 
         main_loss = 1.0 - tm_train
-        if improvement_terms:
-            improvement_loss = torch.stack(improvement_terms).mean()
+        if use_improvement:
+            if improvement_terms:
+                improvement_loss = torch.stack(improvement_terms).mean()
+            else:
+                improvement_loss = pred.new_tensor(0.0)
+            loss = main_loss + float(self.hparams.must_be_better_weight) * improvement_loss
         else:
-            improvement_loss = pred.new_tensor(0.0)
-        loss = main_loss + float(self.hparams.must_be_better_weight) * improvement_loss
+            loss = main_loss
 
         if self.training:
             # Keep train-step logging lightweight.

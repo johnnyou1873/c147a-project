@@ -45,6 +45,7 @@ net:
 
 # compile model for faster training with pytorch 2.0
 compile: false
+loss_mode: improvement_focused_tm
 use_permutation_aware_metric: true
 must_be_better_weight: 0.5
 must_be_better_margin: 0.01
