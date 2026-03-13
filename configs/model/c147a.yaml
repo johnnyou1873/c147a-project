@@ -1,3 +1,6 @@
+# Archived legacy model config.
+# Active replacement:
+#   model=protenix_style
 _target_: src.models.c147a_module.C147ALitModule
 
 optimizer:

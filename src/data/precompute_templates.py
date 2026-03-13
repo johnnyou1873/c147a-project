@@ -16,6 +16,12 @@ import numpy as np
 import torch
 from Bio.Align import PairwiseAligner
 
+from src.data.kaggle_sequence_metadata import (
+    canonicalize_rna_sequence,
+    load_kaggle_sequence_records,
+    resolve_sequences_path,
+)
+
 
 log = logging.getLogger(__name__)
 
@@ -155,8 +161,16 @@ def _load_sequences_and_coords(
     labels_path: Path,
     max_residues_per_target: int = 5120,
     max_targets: int | None = None,
+    sequences_path: Path | None = None,
 ) -> tuple[dict[str, str], dict[str, np.ndarray]]:
     rows_by_target: dict[str, list[tuple[int, int, str, float, float, float]]] = {}
+    skipped_overlong_targets: set[str] = set()
+    resolved_sequences_path = resolve_sequences_path(labels_path=labels_path, sequences_path=sequences_path)
+    sequence_records = (
+        load_kaggle_sequence_records(resolved_sequences_path)
+        if resolved_sequences_path is not None
+        else {}
+    )
 
     with labels_path.open("r", newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
@@ -164,11 +178,15 @@ def _load_sequences_and_coords(
             target_id, pos = _split_target_and_pos(str(row.get("ID", "")))
             if not target_id:
                 continue
+            if target_id in skipped_overlong_targets:
+                continue
             if target_id not in rows_by_target:
                 if max_targets is not None and len(rows_by_target) >= max_targets:
                     continue
                 rows_by_target[target_id] = []
             if len(rows_by_target[target_id]) >= max_residues_per_target:
+                rows_by_target.pop(target_id, None)
+                skipped_overlong_targets.add(target_id)
                 continue
 
             resname = _canonical_resname(str(row.get("resname", "N")))
@@ -181,11 +199,36 @@ def _load_sequences_and_coords(
 
             rows_by_target[target_id].append((pos, line_idx, resname, x, y, z))
 
+    if skipped_overlong_targets:
+        log.info(
+            "Skipped %d targets exceeding max_residues_per_target=%d while loading %s.",
+            len(skipped_overlong_targets),
+            int(max_residues_per_target),
+            labels_path,
+        )
+
     sequences: dict[str, str] = {}
     coords_by_target: dict[str, np.ndarray] = {}
     for target_id, rows in rows_by_target.items():
         rows.sort(key=lambda r: (r[0], r[1]))  # ID suffix order, then file order.
-        seq = "".join(r[2] for r in rows)
+        label_seq = canonicalize_rna_sequence("".join(r[2] for r in rows))
+        if resolved_sequences_path is not None:
+            record = sequence_records.get(target_id)
+            if record is None:
+                raise ValueError(f"Target '{target_id}' was present in {labels_path} but missing from {resolved_sequences_path}.")
+            full_seq = record.sequence
+            if len(full_seq) != len(rows):
+                raise ValueError(
+                    f"Sequence length mismatch for target '{target_id}': labels provide {len(rows)} residues, "
+                    f"but {resolved_sequences_path} provides {len(full_seq)}."
+                )
+            seq = full_seq
+            if label_seq != seq:
+                raise ValueError(
+                    f"Sequence mismatch for target '{target_id}' between {labels_path} and {resolved_sequences_path}."
+                )
+        else:
+            seq = label_seq
         coords = np.asarray([[r[3], r[4], r[5]] for r in rows], dtype=np.float64)
         coords = _fill_missing_coords(coords)
         sequences[target_id] = seq
@@ -750,6 +793,7 @@ def _compute_single_chunk_worker(
 def precompute_template_coords(
     labels_path: str | Path,
     output_path: str | Path,
+    sequences_path: str | Path | None = None,
     top_k_store: int = 5,
     max_residues_per_target: int = 5120,
     max_targets: int | None = None,
@@ -767,6 +811,7 @@ def precompute_template_coords(
     num_threads: int = 0,
 ) -> dict[str, Any]:
     labels = Path(labels_path)
+    sequences_path_resolved = resolve_sequences_path(labels_path=labels, sequences_path=sequences_path)
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -777,6 +822,7 @@ def precompute_template_coords(
         labels_path=labels,
         max_residues_per_target=max_residues_per_target,
         max_targets=search_pool_max_targets_i,
+        sequences_path=sequences_path_resolved,
     )
     valid_target_ids = [tid for tid, c in coords_by_target.items() if _coords_are_valid(c)]
     query_target_ids = (
@@ -1322,6 +1368,7 @@ def precompute_template_coords(
         "protenix_chunks_used": protenix_chunks_used,
         "meta": {
             "labels_path": str(labels.resolve()),
+            "sequences_path": None if sequences_path_resolved is None else str(sequences_path_resolved.resolve()),
             "chunk_selection_policy": CHUNK_SELECTION_POLICY,
             "alignment_mode": "global",
             "top_k_store": int(top_k_store_i),
@@ -1376,6 +1423,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Precompute chunked templates from train_labels.csv")
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--labels-file", type=str, default="train_labels.csv")
+    parser.add_argument("--sequences-file", type=str, default="")
     parser.add_argument("--output-file", type=str, default="template_coords.pt")
     parser.add_argument("--top-k-store", type=int, default=5)
     parser.add_argument("--max-residues-per-target", type=int, default=5120)
@@ -1426,6 +1474,7 @@ def main() -> None:
 
     data_dir = Path(args.data_dir)
     labels_path = data_dir / args.labels_file
+    sequences_path = (data_dir / args.sequences_file) if str(args.sequences_file).strip() else None
     output_path = data_dir / args.output_file
     max_targets = None if args.max_targets <= 0 else args.max_targets
     query_max_targets = None if args.query_max_targets <= 0 else args.query_max_targets
@@ -1433,6 +1482,7 @@ def main() -> None:
 
     precompute_template_coords(
         labels_path=labels_path,
+        sequences_path=sequences_path,
         output_path=output_path,
         top_k_store=args.top_k_store,
         max_residues_per_target=args.max_residues_per_target,

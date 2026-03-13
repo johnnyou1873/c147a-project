@@ -9,19 +9,121 @@ from torch import nn
 from src.models.components.folding_transformer import SE3RefinementBlock
 
 
+class ResidualMLP(nn.Module):
+    def __init__(self, dim: int, mult: int = 4, dropout: float = 0.0) -> None:
+        super().__init__()
+        inner = dim * mult
+        self.norm = nn.LayerNorm(dim)
+        self.net = nn.Sequential(
+            nn.Linear(dim, inner),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(inner, dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.net(self.norm(x))
+
+
+class LocalGraphMessageBlock(nn.Module):
+    """
+    Local graph block over residues inside a chunk.
+    Operates independently per candidate chunk:
+      complexity ~ O(B * W * K * C * |offsets|)
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        edge_dim: int,
+        offsets: Sequence[int] = (1, 2, 4, 8),
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.edge_dim = int(edge_dim)
+        self.offsets = tuple(sorted({int(abs(o)) for o in offsets if int(abs(o)) > 0}))
+        if len(self.offsets) == 0:
+            self.offsets = (1,)
+
+        self.node_norm = nn.LayerNorm(hidden_dim)
+        self.msg_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + edge_dim, hidden_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+        self.update = ResidualMLP(hidden_dim, mult=4, dropout=dropout)
+
+    def _edge_features(
+        self,
+        xyz_i: torch.Tensor,
+        xyz_j: torch.Tensor,
+    ) -> torch.Tensor:
+        delta = xyz_j - xyz_i
+        dist = torch.linalg.norm(delta, dim=-1, keepdim=True).clamp(min=1e-6)
+        unit = delta / dist
+        return torch.cat([unit, dist], dim=-1)  # (..., 4)
+
+    def forward(
+        self,
+        h: torch.Tensor,      # (N, C, H)
+        xyz: torch.Tensor,    # (N, C, 3)
+        valid: torch.Tensor,  # (N, C)
+    ) -> torch.Tensor:
+        n, c, hd = h.shape
+        assert hd == self.hidden_dim
+
+        h_in = self.node_norm(h)
+        agg = torch.zeros_like(h_in)
+
+        for off in self.offsets:
+            if off >= c:
+                continue
+
+            src = slice(off, c)
+            dst = slice(0, c - off)
+            v = valid[:, src] & valid[:, dst]
+            if not bool(v.any().item()):
+                continue
+
+            h_i = h_in[:, dst]
+            h_j = h_in[:, src]
+
+            e_fwd = self._edge_features(xyz[:, dst], xyz[:, src])
+            msg_fwd = self.msg_mlp(torch.cat([h_i, h_j, e_fwd], dim=-1))
+            agg[:, dst] = agg[:, dst] + msg_fwd * v.unsqueeze(-1).float()
+
+            e_rev = self._edge_features(xyz[:, src], xyz[:, dst])
+            msg_rev = self.msg_mlp(torch.cat([h_j, h_i, e_rev], dim=-1))
+            agg[:, src] = agg[:, src] + msg_rev * v.unsqueeze(-1).float()
+
+        h = h + agg * valid.unsqueeze(-1).float()
+        h = self.update(h) * valid.unsqueeze(-1).float()
+        return h
+
+
 class TemplateSegmentAssembler(nn.Module):
     """
-    Simplified chunk assembler:
-    1) 2-layer transformer scorer over [reference_token + 5 candidate tokens]
-       to produce per-token and per-window candidate weights.
-    2) Weighted window coordinate assembly + seam-score weighted Kabsch stitching.
-    3) Single refinement block: transformer OR SE(3).
+    Mixture-of-templates RNA assembler.
+
+    Pipeline:
+    1) Per-candidate local graph encoder over chunk residues.
+    2) Global sequence-context transformer over absolute target positions.
+    3) Shared 2-layer scorer over [reference + all candidates]:
+       - token-level candidate weights
+       - window-level candidate weights
+    4) Sparse confidence-weighted mixture assembly.
+    5) Seam-aware weighted Kabsch stitching.
+    6) Optional refinement:
+       - transformer, or
+       - SE(3) equivariant refinement
     """
 
     def __init__(
         self,
         hidden_dim: int = 256,
-        num_candidates: int = 5,
+        num_candidates: int = 20,
         residue_vocab_size: int = 5,
         max_chain_embeddings: int = 64,
         max_copy_embeddings: int = 64,
@@ -30,38 +132,28 @@ class TemplateSegmentAssembler(nn.Module):
         template_chunk_max_windows: int = 64,
         seq_transformer_layers: int = 4,
         seq_transformer_heads: int = 8,
-        sparse_block_size: int = 64,
-        sparse_window: int = 256,
-        sparse_global_stride: int = 128,
-        sparse_max_global_tokens: int = 64,
         transformer_dropout: float = 0.0,
         cross_attention_heads: int = 8,
+        sparse_window: int = 256,
+        sparse_mixture_topk: int = 2,
+        graph_layers: int = 3,
+        graph_offsets: Sequence[int] = (1, 2, 4, 8, 16),
+        rigid_alignment_enabled: bool = True,
         refinement_block: str = "se3",
+        se3_refinement_enabled: bool = True,
         se3_refine_layers: int = 4,
         se3_num_heads: int = 4,
         se3_dropout: float = 0.0,
         se3_coord_step_size: float = 0.1,
         geometric_constraints_enabled: bool = False,
-        geometric_constraints_passes: int = 3,
         geometric_constraints_strength: float = 0.75,
         geometric_constraints_nonlocal_max_points: int = 160,
         geometric_constraints_nonlocal_min_sep: int = 2,
-        geometric_constraints_repulsion_temp: float = 0.25,
-        local_chunk_layers: int = 4,
-        local_chunk_heads: int = 8,
-        local_chunk_attention_window: int = 64,
-        local_chunk_graph_offsets: Sequence[int] = (1, 2, 4),
-        latent_bottleneck_size: int = 128,
-        latent_refine_layers: int = 6,
         bond_target: float = 5.95,
         twohop_target: float = 10.2,
         clash_min_distance: float = 3.2,
     ) -> None:
         super().__init__()
-        del sparse_block_size, sparse_global_stride, sparse_max_global_tokens
-        del geometric_constraints_passes, geometric_constraints_repulsion_temp
-        del local_chunk_layers, local_chunk_heads, local_chunk_attention_window, local_chunk_graph_offsets
-        del latent_bottleneck_size, latent_refine_layers
 
         self.hidden_dim = int(hidden_dim)
         self.num_candidates = max(1, int(num_candidates))
@@ -71,9 +163,14 @@ class TemplateSegmentAssembler(nn.Module):
         self.max_sequence_positions = self.template_chunk_length + self.template_chunk_stride * max(
             0, self.template_chunk_max_windows - 1
         )
+
         self.refinement_block = str(refinement_block).strip().lower()
         if self.refinement_block not in {"transformer", "se3"}:
             raise ValueError("refinement_block must be one of {'transformer', 'se3'}")
+
+        self.se3_refinement_enabled = bool(se3_refinement_enabled)
+        self.rigid_alignment_enabled = bool(rigid_alignment_enabled)
+        self.sparse_mixture_topk = max(1, int(sparse_mixture_topk))
 
         self.use_geom_aux = bool(geometric_constraints_enabled)
         self.geom_aux_weight = float(geometric_constraints_strength)
@@ -83,26 +180,57 @@ class TemplateSegmentAssembler(nn.Module):
         self.twohop_target = float(twohop_target)
         self.clash_min_distance = float(clash_min_distance)
 
-        # Target-sequence context features.
+        # Target sequence features.
         self.residue_emb = nn.Embedding(residue_vocab_size, hidden_dim)
         self.chain_emb = nn.Embedding(max_chain_embeddings, hidden_dim)
         self.copy_emb = nn.Embedding(max_copy_embeddings, hidden_dim)
         self.resid_proj = nn.Linear(1, hidden_dim)
 
-        # Chunk/candidate token features.
+        # Candidate chunk features.
         self.chunk_residue_emb = nn.Embedding(residue_vocab_size, hidden_dim)
         self.chunk_pos_emb = nn.Embedding(self.template_chunk_length, hidden_dim)
         self.window_emb = nn.Embedding(self.template_chunk_max_windows, hidden_dim)
         self.chunk_coord_proj = nn.Linear(3, hidden_dim)
+
+        # identity, similarity, confidence, source0, source1, valid, coverage
         self.match_meta_proj = nn.Sequential(
-            nn.Linear(6, hidden_dim),
+            nn.Linear(7, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # Shared 2-layer transformer scorer (token-level + window-level use).
-        self.score_role_emb = nn.Embedding(max(8, self.num_candidates) + 1, hidden_dim)
+        # Local graph encoder.
+        self.graph_encoder = nn.ModuleList(
+            [
+                LocalGraphMessageBlock(
+                    hidden_dim=hidden_dim,
+                    edge_dim=4,
+                    offsets=graph_offsets,
+                    dropout=float(transformer_dropout),
+                )
+                for _ in range(max(1, int(graph_layers)))
+            ]
+        )
+
+        # Scoring context.
+        self.score_role_emb = nn.Embedding(max(16, self.num_candidates + 1), hidden_dim)
         self.score_norm = nn.LayerNorm(hidden_dim)
+        self.score_global_norm = nn.LayerNorm(hidden_dim)
+
+        self.score_global_transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=hidden_dim,
+                nhead=max(1, int(seq_transformer_heads)),
+                dim_feedforward=hidden_dim * 4,
+                dropout=float(transformer_dropout),
+                activation="gelu",
+                norm_first=True,
+                batch_first=True,
+            ),
+            num_layers=2,
+            enable_nested_tensor=False,
+        )
+
         self.score_transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=hidden_dim,
@@ -116,21 +244,24 @@ class TemplateSegmentAssembler(nn.Module):
             num_layers=2,
             enable_nested_tensor=False,
         )
+
         self.token_score_head = nn.Linear(hidden_dim, 1)
         self.window_score_head = nn.Linear(hidden_dim, 1)
 
-        # Learnable seam profile for overlap stitching.
+        # Seam profile.
         self.seam_logits = nn.Parameter(torch.zeros(self.template_chunk_length))
 
-        # Shared refinement context projections.
+        # Refinement.
         self.coord_context_proj = nn.Linear(3, hidden_dim)
         self.conf_context_proj = nn.Linear(1, hidden_dim)
         self.refine_norm = nn.LayerNorm(hidden_dim)
+
         self.conf_out = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
+
         if self.refinement_block == "transformer":
             self.global_layers = nn.ModuleList(
                 [
@@ -152,27 +283,31 @@ class TemplateSegmentAssembler(nn.Module):
         else:
             self.global_layers = nn.ModuleList()
             self.coord_delta_head = None
-            self.coord_to_hidden = nn.Linear(3, hidden_dim)
-            self.se3_layers = nn.ModuleList(
-                [
-                    SE3RefinementBlock(
-                        hidden_dim=hidden_dim,
-                        num_heads=max(1, int(se3_num_heads)),
-                        dropout=float(se3_dropout),
-                        coord_step_size=float(se3_coord_step_size),
-                        use_fast_multipole=False,
-                        use_block_sparse_attention=True,
-                        block_sparse_min_seq_len=1,
-                        block_sparse_block_size=64,
-                        block_sparse_window=max(1, int(sparse_window)),
-                        block_sparse_global_stride=128,
-                        block_sparse_max_global=64,
-                        block_sparse_geo_topk=16,
-                        pure_sparse_mode=True,
-                    )
-                    for _ in range(max(1, int(se3_refine_layers)))
-                ]
-            )
+            if self.se3_refinement_enabled:
+                self.coord_to_hidden = nn.Linear(3, hidden_dim)
+                self.se3_layers = nn.ModuleList(
+                    [
+                        SE3RefinementBlock(
+                            hidden_dim=hidden_dim,
+                            num_heads=max(1, int(se3_num_heads)),
+                            dropout=float(se3_dropout),
+                            coord_step_size=float(se3_coord_step_size),
+                            use_fast_multipole=False,
+                            use_block_sparse_attention=True,
+                            block_sparse_min_seq_len=1,
+                            block_sparse_block_size=64,
+                            block_sparse_window=max(1, int(sparse_window)),
+                            block_sparse_global_stride=128,
+                            block_sparse_max_global=64,
+                            block_sparse_geo_topk=16,
+                            pure_sparse_mode=True,
+                        )
+                        for _ in range(max(1, int(se3_refine_layers)))
+                    ]
+                )
+            else:
+                self.coord_to_hidden = None
+                self.se3_layers = nn.ModuleList()
 
         self.last_aux_losses: dict[str, torch.Tensor] = {}
         self.last_confidence: Optional[torch.Tensor] = None
@@ -196,27 +331,14 @@ class TemplateSegmentAssembler(nn.Module):
         template_chunk_source_onehot: Optional[torch.Tensor],
         template_chunk_residue_idx: Optional[torch.Tensor],
     ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
     ]:
         b, l, _ = coords.shape
         if template_chunk_coords is None or template_chunk_coords.dim() != 5:
             c = torch.zeros(
-                b,
-                1,
-                self.num_candidates,
-                self.template_chunk_length,
-                3,
-                device=coords.device,
-                dtype=coords.dtype,
+                b, 1, self.num_candidates, self.template_chunk_length, 3,
+                device=coords.device, dtype=coords.dtype,
             )
             chunk_mask = torch.zeros(b, 1, self.template_chunk_length, device=coords.device, dtype=torch.bool)
             chunk_start = torch.zeros(b, 1, device=coords.device, dtype=torch.long)
@@ -228,9 +350,7 @@ class TemplateSegmentAssembler(nn.Module):
             chunk_source = torch.zeros(b, 1, self.num_candidates, 2, device=coords.device, dtype=coords.dtype)
             chunk_residue = torch.full(
                 (b, 1, self.num_candidates, self.template_chunk_length),
-                4,
-                device=coords.device,
-                dtype=torch.long,
+                4, device=coords.device, dtype=torch.long,
             )
             for bi in range(b):
                 take = min(self.template_chunk_length, int(mask[bi].sum().item()), l)
@@ -329,13 +449,27 @@ class TemplateSegmentAssembler(nn.Module):
         fallback_denom = fallback.sum(dim=-1, keepdim=True).clamp(min=1.0)
         return torch.where(denom > 1e-6, probs / denom.clamp(min=1e-6), fallback / fallback_denom)
 
+    def _sparsify_candidate_probs(self, probs: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        k_total = int(probs.shape[-1])
+        k_keep = min(max(1, int(self.sparse_mixture_topk)), k_total)
+        full = self._normalize_candidate_probs(torch.log(probs.clamp(min=1e-8)), valid)
+        if k_keep >= k_total:
+            return full
+        masked = full.masked_fill(~valid, -1.0)
+        top_idx = torch.topk(masked, k=k_keep, dim=-1).indices
+        keep = torch.zeros_like(valid)
+        keep.scatter_(-1, top_idx, True)
+        keep = keep & valid
+        sparse = full * keep.float()
+        sparse_denom = sparse.sum(dim=-1, keepdim=True)
+        return torch.where(sparse_denom > 1e-6, sparse / sparse_denom.clamp(min=1e-6), full)
+
     def _weighted_kabsch_transform(
         self,
         source: torch.Tensor,
         target: torch.Tensor,
         weights: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (R, t) for row-vector transform: x' = x @ R.T + t."""
         device = source.device
         dtype = source.dtype
         eye = torch.eye(3, device=device, dtype=dtype)
@@ -494,11 +628,23 @@ class TemplateSegmentAssembler(nn.Module):
             abs_idx_clamped = abs_idx.clamp(min=0, max=l - 1)
             target_residue = torch.gather(rid, 1, abs_idx_clamped.view(b, -1)).view(b, w, clen)
             target_resid = torch.gather(resid.to(dtype=coords.dtype), 1, abs_idx_clamped.view(b, -1)).view(b, w, clen)
+            target_xyz = (
+                torch.gather(
+                    coords,
+                    1,
+                    abs_idx_clamped.view(b, -1).unsqueeze(-1).expand(-1, -1, 3),
+                )
+                .view(b, w, clen, 3)
+                .to(dtype=coords.dtype)
+            )
             target_mask = torch.gather(mask.long(), 1, abs_idx_clamped.view(b, -1)).view(b, w, clen).bool()
         else:
+            abs_idx_clamped = abs_idx
             target_residue = torch.zeros(b, w, clen, device=coords.device, dtype=torch.long)
             target_resid = torch.zeros(b, w, clen, device=coords.device, dtype=coords.dtype)
+            target_xyz = torch.zeros(b, w, clen, 3, device=coords.device, dtype=coords.dtype)
             target_mask = torch.zeros(b, w, clen, device=coords.device, dtype=torch.bool)
+
         valid_token = chunk_mask & chunk_window_valid.unsqueeze(-1) & (abs_idx < l) & target_mask
 
         target_token = (
@@ -506,9 +652,11 @@ class TemplateSegmentAssembler(nn.Module):
             + self.resid_proj(target_resid.unsqueeze(-1))
             + self.chunk_pos_emb(pos_ids).view(1, 1, clen, self.hidden_dim)
         )
+
         candidate_residue = self.chunk_residue_emb(
             chunk_residue.clamp(min=0, max=self.chunk_residue_emb.num_embeddings - 1)
         )
+        coverage = chunk_mask.float().mean(dim=-1, keepdim=True).expand(-1, -1, k)
         meta = torch.stack(
             [
                 (chunk_identity / 100.0).clamp(min=0.0, max=2.0),
@@ -517,9 +665,11 @@ class TemplateSegmentAssembler(nn.Module):
                 chunk_source[..., 0].clamp(min=0.0, max=1.0),
                 chunk_source[..., 1].clamp(min=0.0, max=1.0),
                 chunk_valid.float(),
+                coverage,
             ],
             dim=-1,
         )
+
         candidate_token = (
             self.chunk_coord_proj(c)
             + candidate_residue
@@ -527,19 +677,98 @@ class TemplateSegmentAssembler(nn.Module):
             + pos_emb
             + w_emb
             + self.match_meta_proj(meta).unsqueeze(-2)
-        )
+        ) * (chunk_valid.unsqueeze(-1).unsqueeze(-1).float())
 
+        # Local graph encoder per candidate chunk.
+        flat_h = candidate_token.reshape(b * w * k, clen, self.hidden_dim)
+        flat_xyz = c.reshape(b * w * k, clen, 3)
+        flat_valid = (chunk_valid.unsqueeze(-1) & valid_token.unsqueeze(2)).reshape(b * w * k, clen)
+
+        empty_rows = ~flat_valid.any(dim=1)
+        if bool(empty_rows.any().item()):
+            flat_h = flat_h.clone()
+            flat_xyz = flat_xyz.clone()
+            flat_valid = flat_valid.clone()
+            flat_h[empty_rows, 0] = 0.0
+            flat_xyz[empty_rows, 0] = 0.0
+            flat_valid[empty_rows, 0] = True
+
+        for layer in self.graph_encoder:
+            flat_h = layer(flat_h, flat_xyz, flat_valid)
+
+        candidate_token = flat_h.view(b, w, k, clen, self.hidden_dim)
+
+        candidate_coords_c = c.permute(0, 1, 3, 2, 4)          # (B, W, C, K, 3)
         cand_token_valid = chunk_valid.unsqueeze(-1) & valid_token.unsqueeze(2)  # (B, W, K, C)
-        cand_token_valid_c = cand_token_valid.permute(0, 1, 3, 2)  # (B, W, C, K)
-        candidate_token_c = candidate_token.permute(0, 1, 3, 2, 4)  # (B, W, C, K, H)
+        cand_token_valid_c = cand_token_valid.permute(0, 1, 3, 2)                # (B, W, C, K)
+        candidate_token_c = candidate_token.permute(0, 1, 3, 2, 4)               # (B, W, C, K, H)
 
-        score_tokens = torch.cat([target_token.unsqueeze(3), candidate_token_c], dim=3)  # (B, W, C, K+1, H)
         role_ids = torch.arange(k + 1, device=coords.device, dtype=torch.long).clamp(
             max=self.score_role_emb.num_embeddings - 1
         )
-        score_tokens = self.score_norm(score_tokens + self.score_role_emb(role_ids).view(1, 1, 1, k + 1, self.hidden_dim))
-        score_mask = torch.cat([valid_token.unsqueeze(-1), cand_token_valid_c], dim=-1)  # (B, W, C, K+1)
 
+        score_tokens = torch.cat([target_token.unsqueeze(3), candidate_token_c], dim=3)  # (B, W, C, K+1, H)
+        score_mask = torch.cat([valid_token.unsqueeze(-1), cand_token_valid_c], dim=-1)   # (B, W, C, K+1)
+
+        # Global sequence context.
+        global_sum = torch.zeros(b, l, self.hidden_dim, device=coords.device, dtype=score_tokens.dtype)
+        global_count = torch.zeros(b, l, device=coords.device, dtype=score_tokens.dtype)
+        if l > 0:
+            for role_idx in range(k + 1):
+                role_hidden = score_tokens[:, :, :, role_idx, :].reshape(b, -1, self.hidden_dim)
+                role_valid = score_mask[:, :, :, role_idx].reshape(b, -1)
+                abs_flat = abs_idx_clamped.reshape(b, -1)
+                for bi in range(b):
+                    if not bool(role_valid[bi].any().item()):
+                        continue
+                    idx_sel = abs_flat[bi][role_valid[bi]]
+                    hidden_sel = role_hidden[bi][role_valid[bi]]
+                    global_sum[bi].index_add_(0, idx_sel, hidden_sel)
+                    global_count[bi].index_add_(
+                        0,
+                        idx_sel,
+                        torch.ones(idx_sel.shape[0], device=coords.device, dtype=score_tokens.dtype),
+                    )
+
+        global_context = torch.where(
+            global_count.unsqueeze(-1) > 0.0,
+            global_sum / global_count.unsqueeze(-1).clamp(min=1e-6),
+            seq_embed,
+        )
+        global_context = self.score_global_norm(global_context + seq_embed)
+
+        safe_global = global_context
+        safe_global_mask = mask
+        empty_global = ~safe_global_mask.any(dim=1)
+        if bool(empty_global.any().item()):
+            safe_global = safe_global.clone()
+            safe_global_mask = safe_global_mask.clone()
+            safe_global[empty_global, 0] = 0.0
+            safe_global_mask[empty_global, 0] = True
+
+        global_context = self.score_global_transformer(safe_global, src_key_padding_mask=~safe_global_mask)
+        global_context = global_context * mask.unsqueeze(-1).float()
+
+        if l > 0:
+            token_global = (
+                torch.gather(
+                    global_context,
+                    1,
+                    abs_idx_clamped.view(b, -1).unsqueeze(-1).expand(-1, -1, self.hidden_dim),
+                )
+                .view(b, w, clen, self.hidden_dim)
+                .to(dtype=score_tokens.dtype)
+            )
+        else:
+            token_global = torch.zeros(b, w, clen, self.hidden_dim, device=coords.device, dtype=score_tokens.dtype)
+
+        score_tokens = self.score_norm(
+            score_tokens
+            + token_global.unsqueeze(3)
+            + self.score_role_emb(role_ids).view(1, 1, 1, k + 1, self.hidden_dim)
+        )
+
+        # Token-level scoring.
         flat_tokens = score_tokens.reshape(b * w * clen, k + 1, self.hidden_dim)
         flat_mask = score_mask.reshape(b * w * clen, k + 1)
         empty_rows = ~flat_mask.any(dim=1)
@@ -554,16 +783,18 @@ class TemplateSegmentAssembler(nn.Module):
         token_logits = self.token_score_head(encoded_tokens[:, :, :, 1:, :]).squeeze(-1)
         token_scores = self._normalize_candidate_probs(token_logits, cand_token_valid_c)
 
-        encoded_ref = encoded_tokens[:, :, :, 0, :]  # (B, W, C, H)
-        encoded_cand = encoded_tokens[:, :, :, 1:, :].permute(0, 1, 3, 2, 4)  # (B, W, K, C, H)
+        # Window-level scoring.
+        encoded_ref = encoded_tokens[:, :, :, 0, :]
+        encoded_cand = encoded_tokens[:, :, :, 1:, :].permute(0, 1, 3, 2, 4)
         token_weight = valid_token.float()
         token_count = token_weight.sum(dim=2, keepdim=True).clamp(min=1.0)
         ref_summary = (encoded_ref * token_weight.unsqueeze(-1)).sum(dim=2) / token_count
         cand_summary = (
             encoded_cand * token_weight.unsqueeze(2).unsqueeze(-1)
         ).sum(dim=3) / token_count.unsqueeze(2)
+        global_summary = (token_global * token_weight.unsqueeze(-1)).sum(dim=2) / token_count
 
-        window_tokens = torch.cat([ref_summary.unsqueeze(2), cand_summary], dim=2)  # (B, W, K+1, H)
+        window_tokens = torch.cat([ref_summary.unsqueeze(2), cand_summary], dim=2) + global_summary.unsqueeze(2)
         window_tokens = self.score_norm(window_tokens + self.score_role_emb(role_ids).view(1, 1, k + 1, self.hidden_dim))
         window_valid = chunk_valid & chunk_window_valid.unsqueeze(-1)
         window_token_mask = torch.cat([chunk_window_valid.unsqueeze(-1), window_valid], dim=2)
@@ -582,16 +813,18 @@ class TemplateSegmentAssembler(nn.Module):
         window_logits = self.window_score_head(encoded_windows[:, :, 1:, :]).squeeze(-1)
         window_scores = self._normalize_candidate_probs(window_logits, window_valid)
 
+        # Combined sparse mixture.
         combined_scores = token_scores * window_scores.unsqueeze(2)
         combined_scores = self._normalize_candidate_probs(
             logits=torch.log(combined_scores.clamp(min=1e-8)),
             valid=cand_token_valid_c,
         )
+        combined_scores = self._sparsify_candidate_probs(combined_scores, cand_token_valid_c)
 
-        candidate_coords_c = c.permute(0, 1, 3, 2, 4)  # (B, W, C, K, 3)
         window_pred = (combined_scores.unsqueeze(-1) * candidate_coords_c).sum(dim=3)  # (B, W, C, 3)
         token_conf = combined_scores.max(dim=-1).values  # (B, W, C)
 
+        # Seam-aware weighted stitching.
         seam_base = F.softplus(self.seam_logits[:clen]) + 1e-3
         if clen > 1:
             axis = torch.linspace(-1.0, 1.0, steps=clen, device=coords.device, dtype=coords.dtype)
@@ -605,6 +838,7 @@ class TemplateSegmentAssembler(nn.Module):
         stitched_sum = torch.zeros(b, l, 3, device=coords.device, dtype=coords.dtype)
         stitched_w = torch.zeros(b, l, device=coords.device, dtype=coords.dtype)
         stitched_conf_sum = torch.zeros(b, l, device=coords.device, dtype=coords.dtype)
+
         for bi in range(b):
             active_windows = torch.nonzero(chunk_window_valid[bi], as_tuple=False).squeeze(-1)
             if int(active_windows.numel()) > 1:
@@ -627,7 +861,7 @@ class TemplateSegmentAssembler(nn.Module):
                 seam_score = seam_weights[token_idx] * (0.5 + 0.5 * seg_conf).clamp(min=1e-3)
 
                 overlap_mask = stitched_w[bi, abs_pos] > 0.0
-                if int(overlap_mask.sum().item()) >= 3:
+                if self.rigid_alignment_enabled and int(overlap_mask.sum().item()) >= 3:
                     src_ov = seg_coords[overlap_mask]
                     ref_ov = stitched_sum[bi, abs_pos[overlap_mask]] / stitched_w[bi, abs_pos[overlap_mask]].unsqueeze(
                         -1
@@ -685,6 +919,7 @@ class TemplateSegmentAssembler(nn.Module):
             safe_mask = safe_mask.clone()
             safe_hidden[empty_seq, 0] = 0.0
             safe_mask[empty_seq, 0] = True
+
         h = safe_hidden
         if self.refinement_block == "transformer":
             for layer in self.global_layers:
@@ -704,7 +939,6 @@ class TemplateSegmentAssembler(nn.Module):
         self.last_confidence = (0.5 * model_conf + 0.5 * stitched_conf) * mask.float()
         self.last_token_candidate_scores = combined_scores.detach()
         self.last_window_candidate_scores = window_scores.detach()
-
         self.last_aux_losses = self._compute_geom_aux(pred, mask) if self.use_geom_aux else {}
         return pred
 

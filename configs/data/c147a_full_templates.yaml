@@ -1,15 +1,14 @@
-# Archived legacy chunk-template datamodule config.
-# Active training uses `configs/data/c147a_full_templates.yaml`.
-_target_: src.data.c147a_datamodule.C147ADataModule
+_target_: src.data.c147a_full_template_datamodule.C147AFullTemplateDataModule
 data_dir: ${paths.data_dir}
-labels_file: train_labels.csv
+labels_file: C:/kaggle/input/stanford-rna-3d-folding-2/train_labels.csv
+sequences_file: C:/kaggle/input/stanford-rna-3d-folding-2/train_sequences.csv
 batch_size: 1
 num_workers: 4
 pin_memory: False
 persistent_workers: True
 train_fraction: 0.95
 val_fraction: 0.05
-max_residues_per_target: 5120
+max_residues_per_target: 512
 max_targets: null
 template_generation_max_targets: null
 temperature_k: 300.0
@@ -18,18 +17,15 @@ apply_thermal_noise_eval: false
 train_use_template_only_inputs: true
 eval_use_template_only_inputs: true
 use_template_coords: true
-template_file: template_coords.pt
+template_file: full_length_template_coords.pt
 precompute_templates_if_missing: true
 template_precompute_num_threads: 22
-template_min_percent_identity: 50.0
+template_min_percent_identity: 40.0
 template_min_similarity: 0.0
 template_topk_count: 5
-template_chunk_length: 512
-template_chunk_stride: 256
-template_chunk_max_windows: 64
 use_rna_msa_features: true
-rna_msa_mode: template_profile
 rna_msa_max_rows: 6
+rna_msa_fasta_dir: C:/kaggle/input/stanford-rna-3d-folding-2/MSA
 use_rna_bpp_features: true
 rna_bpp_max_span: 256
 rna_bpp_cutoff: 1.0e-4
@@ -37,8 +33,6 @@ rna_bpp_binary_path: ${paths.data_dir}/eternafold/src
 rna_bpp_parameters_path: ${paths.data_dir}/eternafold/parameters/EternaFoldParams.v1
 rna_bpp_cache_dir: eternafold_bpp_cache
 rna_bpp_num_threads: 16
-template_protenix_fallback_zip: protenix_finished_chunks_full_4gpu_2775chunks_20260309T215807Z
-template_protenix_base_confidence: 0.85
 template_force_oracle_only: false
 template_length_ratio_tolerance: 0.3
 seed: 42

@@ -1,3 +1,6 @@
+# Archived legacy model config.
+# Active replacement:
+#   model=protenix_style
 _target_: src.models.c147a_module.C147ALitModule
 
 optimizer:
@@ -9,7 +12,7 @@ optimizer:
 scheduler:
   _target_: torch.optim.lr_scheduler.OneCycleLR
   _partial_: true
-  max_lr: 0.001
+  max_lr: 0.0001
   pct_start: 0.1
   anneal_strategy: cos
   div_factor: 25.0
@@ -18,7 +21,7 @@ scheduler:
 net:
   _target_: src.models.template_assembler.TemplateSegmentAssembler
   hidden_dim: 256
-  num_candidates: 5
+  num_candidates: 20
   residue_vocab_size: 5
   max_chain_embeddings: 64
   max_copy_embeddings: 64
@@ -27,23 +30,21 @@ net:
   template_chunk_max_windows: 64
   seq_transformer_layers: 4
   seq_transformer_heads: 8
-  sparse_block_size: 64
   sparse_window: 256
-  sparse_global_stride: 128
-  sparse_max_global_tokens: 64
-  transformer_dropout: 0.0
+  sparse_mixture_topk: 2
+  graph_layers: 3
+  graph_offsets: [1, 2, 4, 8, 16]
+  transformer_dropout: 0.3
   cross_attention_heads: 8
   refinement_block: se3
   se3_refine_layers: 4
   se3_num_heads: 4
-  se3_dropout: 0.0
+  se3_dropout: 0.1
   se3_coord_step_size: 0.1
-  geometric_constraints_enabled: false
-  geometric_constraints_passes: 3
+  geometric_constraints_enabled: true
   geometric_constraints_strength: 0.75
   geometric_constraints_nonlocal_max_points: 160
   geometric_constraints_nonlocal_min_sep: 2
-  geometric_constraints_repulsion_temp: 0.25
 
 compile: false
 loss_mode: one_minus_tm

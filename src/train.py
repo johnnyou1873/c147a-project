@@ -81,7 +81,14 @@ def _call_trainer_method(method, **kwargs):
     """Call a Trainer method and pass `weights_only=False` when supported."""
     if "weights_only" in inspect.signature(method).parameters:
         kwargs["weights_only"] = False
-    return method(**kwargs)
+    try:
+        return method(**kwargs)
+    except RuntimeError as exc:
+        if "Please call `iter(combined_loader)` first." in str(exc):
+            root_exc = exc.__context__ or exc.__cause__
+            if root_exc is not None:
+                raise root_exc from root_exc
+        raise
 
 
 @task_wrapper
