@@ -47,7 +47,7 @@ net:
   geometric_constraints_nonlocal_min_sep: 2
 
 compile: false
-loss_mode: one_minus_tm
+loss_mode: one_minus_lddt
 use_permutation_aware_metric: true
 must_be_better_weight: 0.5
 must_be_better_margin: 0.01

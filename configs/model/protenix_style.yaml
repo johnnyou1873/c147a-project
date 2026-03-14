@@ -30,10 +30,11 @@ net:
   dropout: 0.1
   template_blocks: 2
   msa_blocks: 1
-  gru_blocks: 8
-  pairformer_blocks: 1
-  diffusion_blocks: 1
+  gru_blocks: 4
+  pairformer_blocks: 2
+  diffusion_blocks: 2
   diffusion_steps: 1
+  num_structure_candidates: 5
   coord_step_size: 0.1
   triangle_attention_mode: linear
   triangle_feature_map_multiplier: 2
@@ -45,7 +46,7 @@ net:
   use_rna_msa: true
 
 compile: false
-loss_mode: one_minus_tm
+loss_mode: one_minus_lddt
 use_permutation_aware_metric: true
 must_be_better_weight: 0.5
 must_be_better_margin: 0.01

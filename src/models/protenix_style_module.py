@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 import math
 from functools import partial
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 from lightning import LightningModule
@@ -24,7 +24,7 @@ class ProtenixStyleLitModule(LightningModule):
         optimizer: torch.optim.Optimizer,
         scheduler: torch.optim.lr_scheduler,
         compile: bool,
-        loss_mode: str = "improvement_focused_tm",
+        loss_mode: str = "one_minus_lddt",
         use_permutation_aware_metric: bool = True,
         must_be_better_weight: float = 0.5,
         must_be_better_margin: float = 0.01,
@@ -36,7 +36,7 @@ class ProtenixStyleLitModule(LightningModule):
         self.save_hyperparameters(logger=False, ignore=["net"])
         self.net = net
         self.loss_mode = str(loss_mode).strip().lower()
-        valid_loss_modes = {"one_minus_tm", "improvement_focused_tm"}
+        valid_loss_modes = {"one_minus_lddt", "improvement_focused_lddt"}
         if self.loss_mode not in valid_loss_modes:
             raise ValueError(
                 f"Invalid loss_mode='{loss_mode}'. Expected one of: {sorted(valid_loss_modes)}"
@@ -46,15 +46,15 @@ class ProtenixStyleLitModule(LightningModule):
         self.val_loss = MeanMetric()
         self.test_loss = MeanMetric()
 
+        self.train_lddt = MeanMetric()
+        self.val_lddt = MeanMetric()
+        self.test_lddt = MeanMetric()
         self.train_tm_score = MeanMetric()
         self.val_tm_score = MeanMetric()
         self.test_tm_score = MeanMetric()
         self.train_template_tm_score = MeanMetric()
         self.val_template_tm_score = MeanMetric()
         self.test_template_tm_score = MeanMetric()
-        self.train_one_minus_tm = MeanMetric()
-        self.val_one_minus_tm = MeanMetric()
-        self.test_one_minus_tm = MeanMetric()
 
     def _build_net_inputs(self, batch: Dict[str, torch.Tensor], *, return_aux_outputs: bool) -> Dict[str, torch.Tensor]:
         net_inputs: Dict[str, torch.Tensor] = {
@@ -116,9 +116,9 @@ class ProtenixStyleLitModule(LightningModule):
 
     def on_train_start(self) -> None:
         self.val_loss.reset()
+        self.val_lddt.reset()
         self.val_tm_score.reset()
         self.val_template_tm_score.reset()
-        self.val_one_minus_tm.reset()
 
     def _d0(self, n_res: int) -> float:
         if n_res <= 15:
@@ -185,6 +185,53 @@ class ProtenixStyleLitModule(LightningModule):
         tm = torch.nan_to_num(tm, nan=0.0, posinf=0.0, neginf=0.0)
         return tm.clamp(min=0.0, max=1.0)
 
+    def _lddt_score(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        cutoff: float = 15.0,
+        smooth: float = 0.25,
+    ) -> torch.Tensor:
+        pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+        target = torch.nan_to_num(target, nan=0.0, posinf=1e4, neginf=-1e4)
+        n_res = int(pred.shape[0])
+        if n_res < 3:
+            return pred.new_tensor(0.0)
+
+        def _compute_lddt(pred_f: torch.Tensor, target_f: torch.Tensor) -> torch.Tensor:
+            pred_dist = torch.cdist(pred_f, pred_f)
+            target_dist = torch.cdist(target_f, target_f)
+            pair_mask = target_dist < cutoff
+            pair_mask.fill_diagonal_(False)
+            if not bool(pair_mask.any()):
+                return pred_f.new_tensor(0.0)
+
+            dist_error = torch.abs(pred_dist - target_dist)
+            thresholds = pred_f.new_tensor((0.5, 1.0, 2.0, 4.0)).view(1, 1, 4)
+            threshold_scores = torch.sigmoid((thresholds - dist_error.unsqueeze(-1)) / smooth)
+            threshold_scores = threshold_scores / torch.sigmoid(thresholds / smooth)
+            pair_scores = threshold_scores.clamp(min=0.0, max=1.0).mean(dim=-1)
+            pair_counts = pair_mask.sum(dim=-1)
+            residue_scores = (pair_scores * pair_mask).sum(dim=-1) / pair_counts.clamp(min=1)
+            residue_valid = pair_counts > 0
+            if not bool(residue_valid.any()):
+                return pred_f.new_tensor(0.0)
+
+            lddt = residue_scores[residue_valid].mean()
+            lddt = torch.nan_to_num(lddt, nan=0.0, posinf=0.0, neginf=0.0)
+            return lddt.clamp(min=0.0, max=1.0)
+
+        use_fp32_distance = pred.device.type == "cuda" and (
+            pred.dtype in (torch.float16, torch.bfloat16) or torch.is_autocast_enabled()
+        )
+        if use_fp32_distance:
+            with torch.autocast(device_type=pred.device.type, enabled=False):
+                score = _compute_lddt(pred.to(dtype=torch.float32), target.to(dtype=torch.float32))
+            return score.to(dtype=pred.dtype)
+
+        return _compute_lddt(pred, target)
+
     def _assign_groups(self, cost: torch.Tensor) -> list[int]:
         """Solve row->col assignment from a square cost matrix."""
         n = int(cost.shape[0])
@@ -224,16 +271,51 @@ class ProtenixStyleLitModule(LightningModule):
                         break
         return assignment
 
-    def _inverse_log_factor(self, baseline_tm: torch.Tensor) -> torch.Tensor:
-        """Higher factor for low baseline TM, lower (plateaued) factor for high baseline TM."""
+    def _inverse_log_factor(self, baseline_score: torch.Tensor) -> torch.Tensor:
+        """Higher factor for low baseline quality, lower (plateaued) factor for high baseline quality."""
         scale = max(float(self.hparams.must_be_better_log_scale), 1e-6)
-        denom = torch.log(baseline_tm * scale + math.e).clamp(min=1e-6)
+        denom = torch.log(baseline_score * scale + math.e).clamp(min=1e-6)
         factor = 1.0 / denom
         factor = factor.clamp(
             min=float(self.hparams.must_be_better_min_factor),
             max=float(self.hparams.must_be_better_max_factor),
         )
         return factor
+
+    def _score_tm_predictions(
+        self,
+        *,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        supervised_mask: torch.Tensor,
+        chain_idx: torch.Tensor,
+        copy_idx: torch.Tensor,
+        permutation_aware: bool | None = None,
+    ) -> torch.Tensor:
+        if permutation_aware is None:
+            permutation_aware = bool(self.hparams.use_permutation_aware_metric)
+
+        with torch.no_grad():
+            tm_scores_metric = []
+            for b in range(pred.shape[0]):
+                valid = supervised_mask[b]
+                pred_b = pred[b, valid].to(dtype=torch.float32)
+                target_b = target[b, valid].to(dtype=torch.float32)
+                chain_b = chain_idx[b, valid]
+                copy_b = copy_idx[b, valid]
+                if pred_b.shape[0] < 3:
+                    continue
+
+                if permutation_aware:
+                    target_eval = self._permutation_aware_target(pred_b, target_b, chain_b, copy_b)
+                else:
+                    target_eval = target_b
+
+                tm_scores_metric.append(self._tm_score(pred_b, target_eval))
+
+            if tm_scores_metric:
+                return torch.stack(tm_scores_metric).mean().to(dtype=pred.dtype)
+            return pred.new_tensor(0.0)
 
     def _permutation_aware_target(
         self,
@@ -294,11 +376,10 @@ class ProtenixStyleLitModule(LightningModule):
         chain_idx: torch.Tensor,
         copy_idx: torch.Tensor,
         target_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Differentiable TM-score for optimization.
-        tm_scores_train = []
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        lddt_scores_train = []
         improvement_terms = []
-        use_improvement = self.loss_mode == "improvement_focused_tm"
+        use_improvement = self.loss_mode == "improvement_focused_lddt"
         supervised_mask = mask if target_mask is None else (mask & target_mask)
         for b in range(pred.shape[0]):
             valid = supervised_mask[b]
@@ -306,14 +387,14 @@ class ProtenixStyleLitModule(LightningModule):
             target_b = target[b, valid]
             if pred_b.shape[0] < 3:
                 continue
-            tm_pred = self._tm_score(pred_b, target_b)
-            tm_scores_train.append(tm_pred)
+            lddt_pred = self._lddt_score(pred_b, target_b)
+            lddt_scores_train.append(lddt_pred)
 
             if use_improvement:
                 with torch.no_grad():
                     input_b = input_coords[b, valid].to(dtype=torch.float32)
                     target_b_f = target_b.to(dtype=torch.float32)
-                    baseline_tm = self._tm_score(input_b, target_b_f)
+                    baseline_lddt = self._lddt_score(input_b, target_b_f)
 
                     template_mask_b = template_mask[b, valid].unsqueeze(-1)
                     if bool(template_mask_b.any()):
@@ -322,19 +403,22 @@ class ProtenixStyleLitModule(LightningModule):
                             template_coords[b, valid].to(dtype=torch.float32),
                             input_b,
                         )
-                        baseline_tm = torch.maximum(baseline_tm, self._tm_score(template_passthrough_b, target_b_f))
+                        baseline_lddt = torch.maximum(
+                            baseline_lddt,
+                            self._lddt_score(template_passthrough_b, target_b_f),
+                        )
 
-                    factor = self._inverse_log_factor(baseline_tm)
+                    factor = self._inverse_log_factor(baseline_lddt)
                     margin = float(self.hparams.must_be_better_margin)
-                    improvement_gap = torch.relu(baseline_tm + margin - tm_pred)
+                    improvement_gap = torch.relu(baseline_lddt + margin - lddt_pred)
                     improvement_terms.append(factor.to(dtype=improvement_gap.dtype) * improvement_gap)
 
-        if tm_scores_train:
-            tm_train = torch.stack(tm_scores_train).mean()
+        if lddt_scores_train:
+            lddt_train = torch.stack(lddt_scores_train).mean()
         else:
-            tm_train = pred.sum() * 0.0
+            lddt_train = pred.sum() * 0.0
 
-        main_loss = 1.0 - tm_train
+        main_loss = 1.0 - lddt_train
         if use_improvement:
             if improvement_terms:
                 improvement_loss = torch.stack(improvement_terms).mean()
@@ -344,35 +428,17 @@ class ProtenixStyleLitModule(LightningModule):
         else:
             loss = main_loss
 
-        if self.training:
-            # Keep train-step logging lightweight.
-            tm_metric = tm_train.detach()
-        else:
-            # Metric path: no-grad, permutation-aware across copy groups.
-            with torch.no_grad():
-                tm_scores_metric = []
-                for b in range(pred.shape[0]):
-                    valid = supervised_mask[b]
-                    pred_b = pred[b, valid].to(dtype=torch.float32)
-                    target_b = target[b, valid].to(dtype=torch.float32)
-                    chain_b = chain_idx[b, valid]
-                    copy_b = copy_idx[b, valid]
-                    if pred_b.shape[0] < 3:
-                        continue
+        lddt_metric = lddt_train.detach()
+        tm_metric = self._score_tm_predictions(
+            pred=pred,
+            target=target,
+            supervised_mask=supervised_mask,
+            chain_idx=chain_idx,
+            copy_idx=copy_idx,
+            permutation_aware=None if not self.training else False,
+        )
 
-                    if self.hparams.use_permutation_aware_metric:
-                        target_eval = self._permutation_aware_target(pred_b, target_b, chain_b, copy_b)
-                    else:
-                        target_eval = target_b
-
-                    tm_scores_metric.append(self._tm_score(pred_b, target_eval))
-
-                if tm_scores_metric:
-                    tm_metric = torch.stack(tm_scores_metric).mean().to(dtype=pred.dtype)
-                else:
-                    tm_metric = pred.new_tensor(0.0)
-
-        return loss, tm_metric
+        return loss, lddt_metric, tm_metric
 
     def _score_template_candidates(
         self,
@@ -384,9 +450,12 @@ class ProtenixStyleLitModule(LightningModule):
         supervised_mask: torch.Tensor,
         chain_idx: torch.Tensor,
         copy_idx: torch.Tensor,
+        permutation_aware: bool | None = None,
     ) -> torch.Tensor:
         if topk_coords is None or topk_coords.numel() == 0:
             return target.new_tensor(0.0)
+        if permutation_aware is None:
+            permutation_aware = bool(self.hparams.use_permutation_aware_metric)
 
         topk_coords_f = topk_coords.to(dtype=torch.float32)
         topk_valid_b = (
@@ -416,7 +485,7 @@ class ProtenixStyleLitModule(LightningModule):
                 target_b = target[b, valid].to(dtype=torch.float32)
                 chain_b = chain_idx[b, valid]
                 copy_b = copy_idx[b, valid]
-                if self.hparams.use_permutation_aware_metric:
+                if permutation_aware:
                     target_eval = self._permutation_aware_target(template_b, target_b, chain_b, copy_b)
                 else:
                     target_eval = target_b
@@ -444,8 +513,8 @@ class ProtenixStyleLitModule(LightningModule):
         chain_idx: torch.Tensor,
         copy_idx: torch.Tensor,
         target_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        use_improvement = self.loss_mode == "improvement_focused_tm"
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        use_improvement = self.loss_mode == "improvement_focused_lddt"
         supervised_mask = mask if target_mask is None else (mask & target_mask)
         pred_valid = (
             pred_topk_valid.to(device=pred_topk_coords.device, dtype=torch.bool)
@@ -458,7 +527,7 @@ class ProtenixStyleLitModule(LightningModule):
             else None
         )
 
-        best_tm_train = []
+        best_lddt_train = []
         improvement_terms = []
         for b in range(pred_topk_coords.shape[0]):
             target_b = target[b]
@@ -471,20 +540,20 @@ class ProtenixStyleLitModule(LightningModule):
                     valid = valid & pred_mask[b, k]
                 if int(valid.sum().item()) < 3:
                     continue
-                candidate_scores.append(self._tm_score(pred_topk_coords[b, k, valid], target_b[valid]))
+                candidate_scores.append(self._lddt_score(pred_topk_coords[b, k, valid], target_b[valid]))
 
             if not candidate_scores:
                 continue
 
-            sample_best_tm = torch.stack(candidate_scores).amax()
-            best_tm_train.append(sample_best_tm)
+            sample_best_lddt = torch.stack(candidate_scores).amax()
+            best_lddt_train.append(sample_best_lddt)
 
             if use_improvement:
                 with torch.no_grad():
                     valid = supervised_mask[b]
                     input_b = input_coords[b, valid].to(dtype=torch.float32)
                     target_b_f = target_b[valid].to(dtype=torch.float32)
-                    baseline_tm = self._tm_score(input_b, target_b_f)
+                    baseline_lddt = self._lddt_score(input_b, target_b_f)
 
                     if raw_template_topk_coords is not None and raw_template_topk_coords.numel() > 0:
                         raw_coords = raw_template_topk_coords.to(device=target.device, dtype=torch.float32)
@@ -509,19 +578,22 @@ class ProtenixStyleLitModule(LightningModule):
                                     raw_coords[b, k, valid],
                                     input_b,
                                 )
-                            baseline_tm = torch.maximum(baseline_tm, self._tm_score(baseline_candidate, target_b_f))
+                            baseline_lddt = torch.maximum(
+                                baseline_lddt,
+                                self._lddt_score(baseline_candidate, target_b_f),
+                            )
 
-                    factor = self._inverse_log_factor(baseline_tm)
+                    factor = self._inverse_log_factor(baseline_lddt)
                     margin = float(self.hparams.must_be_better_margin)
-                    improvement_gap = torch.relu(baseline_tm + margin - sample_best_tm)
+                    improvement_gap = torch.relu(baseline_lddt + margin - sample_best_lddt)
                     improvement_terms.append(factor.to(dtype=improvement_gap.dtype) * improvement_gap)
 
-        if best_tm_train:
-            tm_train = torch.stack(best_tm_train).mean()
+        if best_lddt_train:
+            lddt_train = torch.stack(best_lddt_train).mean()
         else:
-            tm_train = pred_topk_coords.sum() * 0.0
+            lddt_train = pred_topk_coords.sum() * 0.0
 
-        main_loss = 1.0 - tm_train
+        main_loss = 1.0 - lddt_train
         if use_improvement:
             if improvement_terms:
                 improvement_loss = torch.stack(improvement_terms).mean()
@@ -531,21 +603,19 @@ class ProtenixStyleLitModule(LightningModule):
         else:
             loss = main_loss
 
-        if self.training:
-            tm_metric = tm_train.detach()
-        else:
-            with torch.no_grad():
-                tm_metric = self._score_template_candidates(
-                    topk_coords=pred_topk_coords,
-                    topk_valid=pred_topk_valid,
-                    topk_mask=pred_topk_mask,
-                    target=target,
-                    supervised_mask=supervised_mask,
-                    chain_idx=chain_idx,
-                    copy_idx=copy_idx,
-                ).to(dtype=pred_topk_coords.dtype)
+        lddt_metric = lddt_train.detach()
+        tm_metric = self._score_template_candidates(
+            topk_coords=pred_topk_coords,
+            topk_valid=pred_topk_valid,
+            topk_mask=pred_topk_mask,
+            target=target,
+            supervised_mask=supervised_mask,
+            chain_idx=chain_idx,
+            copy_idx=copy_idx,
+            permutation_aware=None if not self.training else False,
+        ).to(dtype=pred_topk_coords.dtype)
 
-        return loss, tm_metric
+        return loss, lddt_metric, tm_metric
 
     def _template_tm_score(
         self,
@@ -553,27 +623,16 @@ class ProtenixStyleLitModule(LightningModule):
         *,
         model_output: Dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        del model_output
         target = batch["target_coords"]
         mask = batch["mask"]
         target_mask = batch.get("target_mask", mask)
         supervised_mask = mask & target_mask
         chain_idx = batch["chain_idx"]
         copy_idx = batch["copy_idx"]
-        template_topk_coords = (
-            batch.get("template_topk_coords")
-            if model_output is None
-            else model_output.get("corrected_template_topk_coords")
-        )
-        template_topk_valid = (
-            batch.get("template_topk_valid")
-            if model_output is None
-            else model_output.get("corrected_template_topk_valid")
-        )
-        template_topk_mask = (
-            batch.get("template_topk_mask")
-            if model_output is None
-            else model_output.get("corrected_template_topk_mask")
-        )
+        template_topk_coords = batch.get("template_topk_coords")
+        template_topk_valid = batch.get("template_topk_valid")
+        template_topk_mask = batch.get("template_topk_mask")
         template_coords = batch.get("template_coords")
         template_mask = batch.get("template_mask")
 
@@ -602,7 +661,7 @@ class ProtenixStyleLitModule(LightningModule):
 
             return target.new_tensor(0.0)
 
-    def model_step(self, batch: Dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def model_step(self, batch: Dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         model_output = self._normalize_model_output(self._forward_model(batch, return_aux_outputs=True))
         pred = model_output["coords"]
         target = batch["target_coords"]
@@ -613,9 +672,13 @@ class ProtenixStyleLitModule(LightningModule):
         template_mask = batch["template_mask"]
         chain_idx = batch["chain_idx"]
         copy_idx = batch["copy_idx"]
-        corrected_topk_coords = model_output.get("corrected_template_topk_coords")
-        corrected_topk_valid = model_output.get("corrected_template_topk_valid")
-        corrected_topk_mask = model_output.get("corrected_template_topk_mask")
+        corrected_topk_coords = model_output.get("candidate_topk_coords")
+        corrected_topk_valid = model_output.get("candidate_topk_valid")
+        corrected_topk_mask = model_output.get("candidate_topk_mask")
+        if corrected_topk_coords is None:
+            corrected_topk_coords = model_output.get("corrected_template_topk_coords")
+            corrected_topk_valid = model_output.get("corrected_template_topk_valid")
+            corrected_topk_mask = model_output.get("corrected_template_topk_mask")
 
         if corrected_topk_coords is not None and torch.is_tensor(corrected_topk_coords) and corrected_topk_coords.numel() > 0:
             raw_template_topk_coords = batch.get("template_topk_coords")
@@ -631,7 +694,7 @@ class ProtenixStyleLitModule(LightningModule):
                 )
                 raw_template_topk_mask = None if template_mask is None else template_mask.unsqueeze(1)
 
-            loss, tm_score = self._masked_template_candidate_losses(
+            loss, lddt_score, tm_score = self._masked_template_candidate_losses(
                 pred_topk_coords=corrected_topk_coords,
                 pred_topk_valid=corrected_topk_valid,
                 pred_topk_mask=corrected_topk_mask,
@@ -645,10 +708,10 @@ class ProtenixStyleLitModule(LightningModule):
                 copy_idx=copy_idx,
                 target_mask=target_mask,
             )
-            template_tm_score = self._template_tm_score(batch, model_output=model_output)
-            return loss, tm_score, template_tm_score
+            template_tm_score = self._template_tm_score(batch)
+            return loss, lddt_score, tm_score, template_tm_score
 
-        loss, tm_score = self._masked_losses(
+        loss, lddt_score, tm_score = self._masked_losses(
             pred,
             target,
             mask,
@@ -660,16 +723,16 @@ class ProtenixStyleLitModule(LightningModule):
             target_mask=target_mask,
         )
         template_tm_score = self._template_tm_score(batch)
-        return loss, tm_score, template_tm_score
+        return loss, lddt_score, tm_score, template_tm_score
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        loss, tm_score, template_tm_score = self.model_step(batch)
-        one_minus_tm = (1.0 - tm_score).detach()
+        loss, lddt_score, tm_score, template_tm_score = self.model_step(batch)
         self.train_loss(loss)
+        self.train_lddt(lddt_score)
         self.train_tm_score(tm_score)
         self.train_template_tm_score(template_tm_score)
-        self.train_one_minus_tm(one_minus_tm)
         self.log("train/loss", self.train_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train/lddt", self.train_lddt, on_step=False, on_epoch=True, prog_bar=True)
         self.log("train/tm_score", self.train_tm_score, on_step=False, on_epoch=True, prog_bar=True)
         self.log(
             "train/template_tm_score",
@@ -678,29 +741,27 @@ class ProtenixStyleLitModule(LightningModule):
             on_epoch=True,
             prog_bar=False,
         )
-        self.log("train/one_minus_tm", self.train_one_minus_tm, on_step=False, on_epoch=True, prog_bar=False)
         return loss
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
-        loss, tm_score, template_tm_score = self.model_step(batch)
-        one_minus_tm = (1.0 - tm_score).detach()
+        loss, lddt_score, tm_score, template_tm_score = self.model_step(batch)
         self.val_loss(loss)
+        self.val_lddt(lddt_score)
         self.val_tm_score(tm_score)
         self.val_template_tm_score(template_tm_score)
-        self.val_one_minus_tm(one_minus_tm)
         self.log("val/loss", self.val_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("val/lddt", self.val_lddt, on_step=False, on_epoch=True, prog_bar=True)
         self.log("val/tm_score", self.val_tm_score, on_step=False, on_epoch=True, prog_bar=True)
         self.log("val/template_tm_score", self.val_template_tm_score, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("val/one_minus_tm", self.val_one_minus_tm, on_step=False, on_epoch=True, prog_bar=False)
 
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
-        loss, tm_score, template_tm_score = self.model_step(batch)
-        one_minus_tm = (1.0 - tm_score).detach()
+        loss, lddt_score, tm_score, template_tm_score = self.model_step(batch)
         self.test_loss(loss)
+        self.test_lddt(lddt_score)
         self.test_tm_score(tm_score)
         self.test_template_tm_score(template_tm_score)
-        self.test_one_minus_tm(one_minus_tm)
         self.log("test/loss", self.test_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("test/lddt", self.test_lddt, on_step=False, on_epoch=True, prog_bar=True)
         self.log("test/tm_score", self.test_tm_score, on_step=False, on_epoch=True, prog_bar=True)
         self.log(
             "test/template_tm_score",
@@ -709,7 +770,6 @@ class ProtenixStyleLitModule(LightningModule):
             on_epoch=True,
             prog_bar=True,
         )
-        self.log("test/one_minus_tm", self.test_one_minus_tm, on_step=False, on_epoch=True, prog_bar=False)
 
     def setup(self, stage: str) -> None:
         if self.hparams.compile and stage == "fit":

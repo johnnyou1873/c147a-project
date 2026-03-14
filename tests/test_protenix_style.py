@@ -116,7 +116,7 @@ def test_forward_supports_template_and_msa_paths() -> None:
     assert torch.isfinite(pred).all()
 
 
-def test_forward_can_return_corrected_template_candidates() -> None:
+def test_forward_can_return_candidate_models() -> None:
     net = _make_net(
         c_s=12,
         c_token=12,
@@ -145,9 +145,9 @@ def test_forward_can_return_corrected_template_candidates() -> None:
 
     assert isinstance(output, dict)
     assert output["coords"].shape == (1, 4, 3)
-    assert output["corrected_template_topk_coords"].shape == (1, 2, 4, 3)
-    assert output["corrected_template_topk_valid"].shape == (1, 2)
-    assert torch.isfinite(output["corrected_template_topk_coords"]).all()
+    assert output["candidate_topk_coords"].shape == (1, 5, 4, 3)
+    assert output["candidate_topk_valid"].shape == (1, 5)
+    assert torch.isfinite(output["candidate_topk_coords"]).all()
 
 
 def test_forward_clamps_out_of_range_chain_and_copy_ids() -> None:

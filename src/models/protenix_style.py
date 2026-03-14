@@ -1247,6 +1247,7 @@ class ProtenixStyleNet(nn.Module):
         pairformer_blocks: int = 8,
         diffusion_blocks: int = 8,
         diffusion_steps: int = 2,
+        num_structure_candidates: int = 5,
         coord_step_size: float = 0.1,
         triangle_attention_mode: str = "linear",
         triangle_feature_map_multiplier: int = 2,
@@ -1278,6 +1279,7 @@ class ProtenixStyleNet(nn.Module):
         self.template_c = max(1, int(template_c))
         self.diffusion_c_a = max(1, int(self.c_s * 2 if diffusion_c_a is None else diffusion_c_a))
         self.diffusion_steps = max(1, int(diffusion_steps))
+        self.num_structure_candidates = max(1, int(num_structure_candidates))
         self.gru_blocks = max(0, int(gru_blocks))
         self.use_templates = bool(use_templates)
         self.use_rna_msa = bool(use_rna_msa)
@@ -1375,6 +1377,7 @@ class ProtenixStyleNet(nn.Module):
             n_heads=num_heads,
             coord_step_size=coord_step_size,
         )
+        self.structure_candidate_embed = nn.Embedding(self.num_structure_candidates, self.c_s)
 
     def _masked_coord_center(self, coords: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         mask_f = _mask_f(mask, dtype=coords.dtype)
@@ -1446,37 +1449,23 @@ class ProtenixStyleNet(nn.Module):
             template_topk_residue_idx = residue_idx.unsqueeze(1).expand(-1, template_topk_coords.shape[1], -1)
         return template_topk_coords, template_topk_mask, template_topk_valid, template_topk_residue_idx
 
-    def _prepare_diffusion_template_candidates(
+    def _prepare_structure_candidates(
         self,
         *,
         coords_centered: torch.Tensor,
         mask: torch.Tensor,
-        template_topk_coords: Optional[torch.Tensor],
-        template_topk_mask: Optional[torch.Tensor],
-        template_topk_valid: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if template_topk_coords is None or template_topk_coords.numel() == 0:
-            return (
-                coords_centered.unsqueeze(1),
-                mask.unsqueeze(1),
-                torch.ones(coords_centered.shape[0], 1, device=coords_centered.device, dtype=torch.bool),
-            )
-
-        candidate_coords = template_topk_coords.to(device=coords_centered.device, dtype=coords_centered.dtype)
-        if template_topk_mask is None:
-            template_topk_mask = mask.unsqueeze(1).expand(candidate_coords.shape[:3])
-        candidate_mask = template_topk_mask.to(device=coords_centered.device, dtype=torch.bool)
-        candidate_valid = (
-            candidate_mask.any(dim=-1)
-            if template_topk_valid is None
-            else template_topk_valid.to(device=coords_centered.device, dtype=torch.bool)
+        candidate_coords = coords_centered.unsqueeze(1).expand(-1, self.num_structure_candidates, -1, -1).contiguous()
+        candidate_mask = mask.unsqueeze(1).expand(-1, self.num_structure_candidates, -1)
+        candidate_valid = torch.ones(
+            coords_centered.shape[0],
+            self.num_structure_candidates,
+            device=coords_centered.device,
+            dtype=torch.bool,
         )
-        coords_fallback = coords_centered.unsqueeze(1).expand_as(candidate_coords)
-        candidate_coords = torch.where(candidate_mask.unsqueeze(-1), candidate_coords, coords_fallback)
-        candidate_coords = candidate_coords * candidate_mask.unsqueeze(-1).to(dtype=candidate_coords.dtype)
         return candidate_coords, candidate_mask, candidate_valid
 
-    def _run_template_candidate_diffusion(
+    def _run_structure_candidate_diffusion(
         self,
         *,
         candidate_coords: torch.Tensor,
@@ -1508,6 +1497,8 @@ class ProtenixStyleNet(nn.Module):
         flat_z_trunk = _repeat_across_candidates(z_trunk)
         flat_pair_mask = _repeat_across_candidates(pair_mask)
         flat_pair_z = _repeat_across_candidates(pair_z)
+        slot_bias = self.structure_candidate_embed.weight.unsqueeze(0).expand(bsz, -1, -1).reshape(bsz * n_candidates, self.c_s)
+        flat_s_trunk = flat_s_trunk + slot_bias.unsqueeze(1)
 
         noise_schedule = torch.linspace(1.0, 0.2, steps=self.diffusion_steps, device=flat_coords.device, dtype=coords_dtype)
         for noise_level in noise_schedule:
@@ -1680,14 +1671,11 @@ class ProtenixStyleNet(nn.Module):
             z_trunk=z,
             pair_mask=pair_mask,
         )
-        candidate_coords, candidate_mask, candidate_valid = self._prepare_diffusion_template_candidates(
+        candidate_coords, candidate_mask, candidate_valid = self._prepare_structure_candidates(
             coords_centered=coords_centered,
             mask=mask,
-            template_topk_coords=template_topk_coords,
-            template_topk_mask=template_topk_mask,
-            template_topk_valid=template_topk_valid,
         )
-        aggregated_coords, corrected_templates, corrected_mask, corrected_valid = self._run_template_candidate_diffusion(
+        aggregated_coords, corrected_templates, corrected_mask, corrected_valid = self._run_structure_candidate_diffusion(
             candidate_coords=candidate_coords,
             candidate_mask=candidate_mask,
             candidate_valid=candidate_valid,
@@ -1706,9 +1694,9 @@ class ProtenixStyleNet(nn.Module):
             return aggregated_coords
         return {
             "coords": aggregated_coords,
-            "corrected_template_topk_coords": corrected_templates,
-            "corrected_template_topk_mask": corrected_mask,
-            "corrected_template_topk_valid": corrected_valid,
+            "candidate_topk_coords": corrected_templates,
+            "candidate_topk_mask": corrected_mask,
+            "candidate_topk_valid": corrected_valid,
         }
 
 
